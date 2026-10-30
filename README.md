@@ -30,7 +30,7 @@ subject to that pause. This project uses a different render path entirely.
                  │
                  ├─ video ─► ffmpeg ─► MPEG1-TS ─► WebSocket ─► JSMpeg
                  │           (mpeg1video, 30 fps,    (binary)     (JS/WebGL
-                 │            scaled 360/480/720p)                 decoder)
+                 │            scaled 360/480/720/1080p)                 decoder)
                  │                                                    │
                  │                                                 <canvas>
                  └─ audio ─► ffmpeg ─► MP3 ─► HTTP ─► <audio> element
@@ -84,7 +84,7 @@ plain LAN) covers the page, the APIs and the `wss://` upgrade at once.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| WS | `/ws/mpeg1?v=VIDEOID&quality=360\|480\|720` | MPEG1-TS video over WebSocket. Text frames are JSON `{type:"status"\|"error", ...}`. Also accepts `?url=<direct media URL>` (validated) for testing/other sources. |
+| WS | `/ws/mpeg1?v=VIDEOID&quality=360\|480\|720\|1080` | MPEG1-TS video over WebSocket. Text frames are JSON `{type:"status"\|"error", ...}`. Also accepts `?url=<direct media URL>` (validated) for testing/other sources. |
 | GET | `/api/audio?v=VIDEOID` | MP3 audio stream (`audio/mpeg`) for the same video. Also accepts `?url=`. |
 | GET | `/api/search?q=QUERY` | JSON `{ok, results:[{id,title,channel,duration,viewCount}]}` (yt-dlp `ytsearch20:`) |
 | GET | `/api/trending?region=US` | Same JSON shape; yt-dlp trending feed first, Piped/Invidious fallback; the `source` field says which path answered |
@@ -198,8 +198,13 @@ ProxyTimeout 300
 | 360 | 640×360 | 640×360 | 700k |
 | 480 (default) | 854×480 | 854×480 | 1100k |
 | 720 | 1280×720 | 1280×720 | 1800k |
+| 1080 | 1920×1080 | 1920×1080 | 3500k |
 
-All at 30 fps, MPEG-1 (`-bf 0`, `-q:v 5`). MPEG-1 is old but that is the
+All at 30 fps, MPEG-1 (`-bf 0`, `-q:v 5`). 1080p is opt-in and heavy:
+it roughly triples the 720p bitrate and is the most demanding preset
+for both the server's encoder and the car's JS decoder — expect it to
+be the first preset to stutter on weak hardware or a slow uplink.
+MPEG-1 is old but that is the
 point: JSMpeg can decode it in JS/WebGL at 30 fps in the Tesla browser,
 which modern codecs (needing MSE/WebCodecs — limited/absent in
 QtWebEngine) cannot do here.
@@ -233,7 +238,8 @@ QtWebEngine) cannot do here.
   when the duration is unknown. Live streams resolve too, but latency
   will be higher than the Twitch original.
 - **ffmpeg CPU:** MPEG-1 transcoding is done in software; 720p needs a
-  reasonably modern CPU core per concurrent viewer.
+  reasonably modern CPU core per concurrent viewer, and 1080p needs
+  noticeably more — on both the server and the car's decoder.
 - **Tesla can change things:** any Tesla software update can alter the
   browser's restrictions. The `/probe/` page exists to re-check what the
   car still allows.

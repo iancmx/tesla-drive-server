@@ -53,6 +53,7 @@ const QUALITY = {
   '360': { scale: '640:360', canvas: [640, 360], bitrate: '700k' },
   '480': { scale: '854:480', canvas: [854, 480], bitrate: '1100k' },
   '720': { scale: '1280:720', canvas: [1280, 720], bitrate: '1800k' },
+  '1080': { scale: '1920:1080', canvas: [1920, 1080], bitrate: '3500k' },
 };
 const WATCH_URL = (id) => 'https://www.youtube.com/watch?v=' + id;
 

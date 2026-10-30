@@ -118,6 +118,7 @@ main{padding:14px 18px 30px}
       <option value="360">360p</option>
       <option value="480" selected>480p</option>
       <option value="720">720p</option>
+      <option value="1080">1080p (heavy)</option>
     </select>
   </div>
 </header>
@@ -158,6 +159,7 @@ main{padding:14px 18px 30px}
         <option value="360">360p</option>
         <option value="480" selected>480p</option>
         <option value="720">720p</option>
+        <option value="1080">1080p (heavy)</option>
       </select>
       <span class="npstate" id="npState">Idle</span>
       <span id="npFps">0 FPS</span>
@@ -426,7 +428,7 @@ main{padding:14px 18px 30px}
     seekInFlight = baseTimeSec > 0;
     showWatch();
     var quality = $('quality').value;
-    var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720] }[quality] || [854, 480];
+    var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720], '1080': [1920, 1080] }[quality] || [854, 480];
     nc.width = dims[0]; nc.height = dims[1];
     $('npTitle').textContent = it.title || it.id;
     $('npChannel').textContent = it.channel || '';

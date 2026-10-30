@@ -74,6 +74,10 @@ main{padding:14px 18px 30px}
 #nc{width:100%;display:block;background:#000}
 .watchtitle{font-size:20px;font-weight:600;line-height:1.35;margin-top:14px}
 .watchchannel{color:var(--sub);font-size:14.5px;margin-top:5px}
+.seekrow{display:flex;align-items:center;gap:14px;margin-top:14px;background:var(--surface);border-radius:12px;padding:8px 14px}
+.seekrow .time{min-width:58px;text-align:center;font-size:14px;font-variant-numeric:tabular-nums;color:var(--text)}
+.seekrow input[type=range]{flex:1;min-width:120px;accent-color:var(--red);height:36px}
+.seekrow input[type=range]:disabled{opacity:.35}
 .watchctl{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px;background:var(--surface);border-radius:12px;padding:10px 14px}
 .watchctl .btn{background:#3d3d3d;border-radius:999px;padding:11px 18px;font-size:14.5px;font-weight:500;min-height:44px}
 .watchctl .btn-stop{background:#600}
@@ -133,8 +137,15 @@ main{padding:14px 18px 30px}
     <div class="canvaswrap"><canvas id="nc" width="854" height="480"></canvas></div>
     <div class="watchtitle" id="npTitle">—</div>
     <div class="watchchannel" id="npChannel"></div>
+    <div class="seekrow">
+      <span class="time" id="timeNow">0:00</span>
+      <input type="range" id="seek" min="0" max="0" step="1" value="0" disabled aria-label="Seek">
+      <span class="time" id="timeDur">0:00</span>
+    </div>
     <div class="watchctl">
       <button class="btn btn-stop" id="npStop">Stop</button>
+      <button class="btn" id="btnBack10" disabled>&#8722;10s</button>
+      <button class="btn" id="btnFwd10" disabled>+10s</button>
       <label for="vol">Sound</label>
       <input type="range" id="vol" min="0" max="100" value="100">
       <button class="btn" id="btnSync">Sync +2s</button>
@@ -159,6 +170,12 @@ main{padding:14px 18px 30px}
   var player = null, cur = null, curId = null;
   var fpsCount = 0, lastFps = 0, syncTimer = null, forceTimer = null;
   var homeScroll = 0, activeChip = 'All';
+  // Restart-seeking state: the MPEG1 stream itself has no timeline, so the
+  // client tracks a virtual one — baseTimeSec is where the current stream
+  // started in the source video, streamStartedAtMs is when its first frame
+  // was decoded. Seeking = restart both pipes at a new baseTimeSec.
+  var playSeq = 0, durationSec = null, isLiveStream = false;
+  var baseTimeSec = 0, streamStartedAtMs = null, scrubbing = false, seekInFlight = false;
 
   var CHIPS = ['All', 'Music', 'Gaming', 'News', 'Live', 'Technology', 'Cars', 'Comedy', 'Sports', 'Science', 'Travel'];
   var AVATAR_COLORS = ['#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0', '#00838f', '#2e7d32', '#f9a825', '#ef6c00', '#4e342e', '#546e7a'];
@@ -305,18 +322,57 @@ main{padding:14px 18px 30px}
     requestAnimationFrame(function () { window.scrollTo(0, y); });
   }
 
+  // ---- virtual timeline / restart seeking ----
+  function currentPosition() {
+    if (!cur) return 0;
+    var pos = baseTimeSec;
+    if (streamStartedAtMs != null) pos += (performance.now() - streamStartedAtMs) / 1000;
+    if (durationSec != null) pos = Math.min(pos, durationSec);
+    return Math.max(0, pos);
+  }
+  function seekEnabled() {
+    return !!(cur && durationSec != null && durationSec > 0 && !isLiveStream);
+  }
+  function updateSeekUI() {
+    var seek = $('seek');
+    var canSeek = seekEnabled() && !seekInFlight;
+    seek.disabled = !canSeek;
+    $('btnBack10').disabled = !canSeek;
+    $('btnFwd10').disabled = !canSeek;
+    seek.max = durationSec != null ? Math.floor(durationSec) : 0;
+    $('timeDur').textContent = durationSec != null ? fmtDur(durationSec) : (isLiveStream ? 'Live' : '–:––');
+    if (!scrubbing) {
+      var pos = currentPosition();
+      seek.value = Math.floor(pos);
+      $('timeNow').textContent = fmtDur(pos);
+    }
+  }
+  setInterval(updateSeekUI, 250);
+  function seekTo(target) {
+    if (!seekEnabled()) return;
+    var t = Math.max(0, Math.min(Number(target) || 0, Math.max(0, durationSec - 0.3)));
+    startPlayback(cur, t);
+  }
+  function seekBy(delta) { seekTo(currentPosition() + delta); }
+
   // ===== MPEG1 playback (canvas + JSMpeg, separate MP3 audio pipe) =====
-  function startVideo() {
+  function startVideo(token) {
     var quality = $('quality').value;
     var wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host +
-      '/ws/mpeg1?v=' + encodeURIComponent(curId) + '&quality=' + encodeURIComponent(quality);
-    $('npState').textContent = 'Starting video...';
+      '/ws/mpeg1?v=' + encodeURIComponent(curId) + '&quality=' + encodeURIComponent(quality) +
+      '&t=' + encodeURIComponent(baseTimeSec);
+    $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Starting video...';
     fpsCount = 0; lastFps = 0; $('npFps').textContent = '0 FPS';
     player = new JSMpeg.Player(wsUrl, {
       canvas: nc, audio: false, streaming: true, maxBufferSize: 1024 * 1024,
       pauseWhenHidden: false, preserveDrawingBuffer: true,
       onVideoDecode: function () {
-        if (!player) return;
+        if (!player || token !== playSeq) return;
+        if (streamStartedAtMs == null) {
+          streamStartedAtMs = performance.now();
+          seekInFlight = false;
+          updateSeekUI();
+        }
         fpsCount++;
         var now = Date.now();
         if (now - lastFps >= 1000) {
@@ -325,33 +381,69 @@ main{padding:14px 18px 30px}
           $('npState').textContent = 'Playing';
         }
       },
-      onSourceEstablished: function () { $('npState').textContent = 'Connected'; },
-      onSourceCompleted: function () { $('npState').textContent = 'Ended'; }
+      onSourceEstablished: function () { if (token === playSeq) $('npState').textContent = 'Connected'; },
+      onSourceCompleted: function () {
+        if (token !== playSeq) return;
+        $('npState').textContent = 'Ended';
+        if (durationSec != null) { baseTimeSec = durationSec; streamStartedAtMs = null; }
+        seekInFlight = false;
+        updateSeekUI();
+      }
     });
   }
 
-  function play(it) {
-    stopPlayback();
+  function teardownStreams() {
+    if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+    if (forceTimer) { clearTimeout(forceTimer); forceTimer = null; }
+    if (player) { try { player.destroy(); } catch (e) {} player = null; }
+    try { na.pause(); na.removeAttribute('src'); na.load(); } catch (e) {}
+  }
+
+  function startPlayback(it, startSec) {
+    var token = ++playSeq;
+    teardownStreams();
     cur = it; curId = it.id;
+    durationSec = (typeof it.duration === 'number' && it.duration > 0) ? it.duration : null;
+    isLiveStream = false;
+    baseTimeSec = Math.max(0, Number(startSec) || 0);
+    if (durationSec != null) baseTimeSec = Math.min(baseTimeSec, Math.max(0, durationSec - 0.3));
+    streamStartedAtMs = null;
+    seekInFlight = baseTimeSec > 0;
     showWatch();
     var quality = $('quality').value;
     var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720] }[quality] || [854, 480];
     nc.width = dims[0]; nc.height = dims[1];
     $('npTitle').textContent = it.title || it.id;
     $('npChannel').textContent = it.channel || '';
-    $('npState').textContent = 'Buffering audio...';
+    $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Buffering audio...';
+    updateSeekUI();
 
-    // Audio first (MP3 pipe); video waits for it, like the original client.
+    // If the grid item had no duration, fetch it so seeking can unlock.
+    if (durationSec == null) {
+      fetch('/api/info?v=' + encodeURIComponent(it.id)).then(function (r) { return r.json(); }).then(function (d) {
+        if (token !== playSeq || !d || !d.ok) return;
+        isLiveStream = !!d.isLive;
+        if (!isLiveStream && typeof d.duration === 'number' && d.duration > 0) durationSec = d.duration;
+        updateSeekUI();
+      }).catch(function () {});
+    }
+
+    // Audio first (MP3 pipe, restarted at baseTimeSec); video waits for it,
+    // like the original client.
     na.preload = 'none';
-    na.src = '/api/audio?v=' + encodeURIComponent(it.id) + '&_=' + Date.now();
+    na.src = '/api/audio?v=' + encodeURIComponent(it.id) + '&t=' + encodeURIComponent(baseTimeSec) + '&_=' + Date.now();
     na.load();
-    (function tp() { if (curId) na.play().catch(function () { setTimeout(tp, 150); }); })();
+    (function tp() {
+      if (token !== playSeq || !curId) return;
+      var p = na.play();
+      if (p && p.catch) p.catch(function () { setTimeout(tp, 150); });
+    })();
 
     // Keep an eye on the ~5s audio buffer: nudge forward once playing, and
     // launch the video stream as soon as audio is actually playing.
     var nudged = false;
     syncTimer = setInterval(function () {
-      if (!curId) return;
+      if (token !== playSeq || !curId) return;
       if (!na.paused && na.readyState >= 2) {
         if (!nudged && na.currentTime < 3) {
           try { na.currentTime = Math.min(na.currentTime + 4, (na.duration || 999)); } catch (e) {}
@@ -360,23 +452,29 @@ main{padding:14px 18px 30px}
       }
       if (!player && !na.paused && na.readyState >= 2 && na.currentTime > 0) {
         clearInterval(syncTimer); syncTimer = null;
-        startVideo();
+        startVideo(token);
       }
     }, 250);
 
     // Timeout: force-start video after 10s even without audio.
     forceTimer = setTimeout(function () {
-      if (!player && curId) { $('npState').textContent = 'Forced start (no audio yet)...'; startVideo(); }
+      if (token === playSeq && !player && curId) {
+        $('npState').textContent = 'Forced start (no audio yet)...';
+        startVideo(token);
+      }
     }, 10000);
   }
 
+  function play(it) { startPlayback(it, 0); }
+
   function stopPlayback() {
-    if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
-    if (forceTimer) { clearTimeout(forceTimer); forceTimer = null; }
-    if (player) { try { player.destroy(); } catch (e) {} player = null; }
-    try { na.pause(); na.removeAttribute('src'); na.load(); } catch (e) {}
+    playSeq++;
+    teardownStreams();
     cur = null; curId = null;
+    durationSec = null; isLiveStream = false;
+    baseTimeSec = 0; streamStartedAtMs = null; seekInFlight = false; scrubbing = false;
     $('npState').textContent = 'Stopped';
+    updateSeekUI();
   }
 
   $('npStop').onclick = stopPlayback;
@@ -384,10 +482,22 @@ main{padding:14px 18px 30px}
   $('logoHome').onclick = function () { if ($('watchView').style.display === 'block') showHome(); };
   $('btnSync').onclick = function () { try { na.currentTime = Math.min(na.currentTime + 2, na.duration || 999); } catch (e) {} };
   $('vol').oninput = function () { na.volume = this.value / 100; };
+  $('btnBack10').onclick = function () { seekBy(-10); };
+  $('btnFwd10').onclick = function () { seekBy(10); };
+  $('seek').oninput = function () {
+    scrubbing = true;
+    $('timeNow').textContent = fmtDur(Number(this.value) || 0);
+    if (seekEnabled()) $('npState').textContent = 'Seek to ' + fmtDur(Number(this.value) || 0);
+  };
+  $('seek').onchange = function () {
+    var target = Number(this.value) || 0;
+    scrubbing = false;
+    seekTo(target);
+  };
 
   function syncQuality(fromEl, toEl) {
     toEl.value = fromEl.value;
-    if (cur) { var it = cur; play(it); }
+    if (cur) startPlayback(cur, currentPosition());
   }
   $('quality').onchange = function () { syncQuality($('quality'), $('qualityWatch')); };
   $('qualityWatch').onchange = function () { syncQuality($('qualityWatch'), $('quality')); };

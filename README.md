@@ -218,9 +218,15 @@ QtWebEngine) cannot do here.
   `YT_DLP_COOKIES=/path/to/cookies.txt` in `.env` (passed to yt-dlp as
   `--cookies`). Keep that file private — it is a login credential.
 - **VOD, not live-optimized:** this YouTube version resolves `bestvideo`
-  for a video ID and transcodes from the start; seeking inside the video
-  stream is not supported (pause = stop, replay = restart). Live streams
-  resolve too, but latency will be higher than the Twitch original.
+  for a video ID and transcodes as a forward stream. Seeking is
+  *restart seeking*: both stream endpoints accept `?t=SECONDS`
+  (`/ws/mpeg1?v=…&t=642`, `/api/audio?v=…&t=642`), which the server passes
+  to ffmpeg as an input seek (`-ss` before `-i`), and the client tracks a
+  virtual timeline (progress bar, ±10 s buttons) on top. A jump therefore
+  takes a few seconds (new resolve + transcode start) and nothing is
+  downloaded or cached in full. Seeking is disabled for live streams and
+  when the duration is unknown. Live streams resolve too, but latency
+  will be higher than the Twitch original.
 - **ffmpeg CPU:** MPEG-1 transcoding is done in software; 720p needs a
   reasonably modern CPU core per concurrent viewer.
 - **Tesla can change things:** any Tesla software update can alter the

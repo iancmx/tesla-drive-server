@@ -122,6 +122,20 @@ function parseQuality(raw) {
   return QUALITY[String(raw)] ? String(raw) : '480';
 }
 
+// Parse a restart-seek offset (`?t=SECONDS`). Absent means 0. A present but
+// invalid value returns null so callers can reject it instead of silently
+// restarting from the beginning.
+function parseSeekOffset(raw) {
+  if (raw === undefined || raw === null || raw === '') return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 24 * 3600) return null;
+  return Math.floor(n * 1000) / 1000;
+}
+
+function seekArgs(startSeconds) {
+  return startSeconds > 0 ? ['-ss', String(startSeconds)] : [];
+}
+
 function mapFlatEntry(e) {
   if (!e || typeof e !== 'object') return null;
   const id = e.id || (e.url && String(e.url).match(/[?&]v=([A-Za-z0-9_-]{11})/)?.[1]);
@@ -270,13 +284,14 @@ app.get('/api/trending', async (req, res) => {
 });
 
 // ---- Audio (separate MP3 pipe, as in the original repo) --------------------
-function streamMp3(req, res, inputUrl) {
+function streamMp3(req, res, inputUrl, startSeconds = 0) {
   res.writeHead(200, {
     'Content-Type': 'audio/mpeg',
     'Cache-Control': 'no-cache, no-store',
     'Access-Control-Allow-Origin': '*',
   });
   const ffmpeg = spawn('ffmpeg', [
+    ...seekArgs(startSeconds),
     '-re', '-reconnect', '1', '-reconnect_at_eof', '1',
     '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
     '-i', inputUrl, '-vn',
@@ -293,16 +308,18 @@ function streamMp3(req, res, inputUrl) {
 }
 
 app.get('/api/audio', async (req, res) => {
+  const startSeconds = parseSeekOffset(req.query.t ?? req.query.start);
+  if (startSeconds === null) return res.status(400).json({ ok: false, error: 'Invalid t (seek offset in seconds)' });
   if (req.query.url) {
     const direct = validateDirectUrl(String(req.query.url));
     if (!direct) return res.status(400).json({ ok: false, error: 'Invalid url' });
-    return streamMp3(req, res, direct);
+    return streamMp3(req, res, direct, startSeconds);
   }
   const id = String(req.query.v || '');
   if (!VIDEO_ID_RE.test(id)) return res.status(400).json({ ok: false, error: 'Invalid video id' });
   try {
     const audioUrl = await resolveStream(id, 'bestaudio[ext=m4a]/bestaudio/best');
-    streamMp3(req, res, audioUrl);
+    streamMp3(req, res, audioUrl, startSeconds);
   } catch (e) {
     res.status(502).json({ ok: false, error: e.type || 'resolve-failed', detail: e.stderr || '' });
   }
@@ -334,6 +351,12 @@ wss.on('connection', async (ws, req) => {
 
   const quality = parseQuality(params.get('quality'));
   const q = QUALITY[quality];
+  const startSeconds = parseSeekOffset(params.get('t') ?? params.get('start'));
+  if (startSeconds === null) {
+    sendJson({ type: 'error', message: 'Invalid ?t= (seek offset in seconds)' });
+    ws.close();
+    return;
+  }
   let inputUrl = null;
 
   const direct = params.get('url');
@@ -361,9 +384,14 @@ wss.on('connection', async (ws, req) => {
   }
 
   if (ws.readyState !== 1) return;
-  sendJson({ type: 'status', message: 'Starting MPEG1-TS stream (' + quality + 'p)...' });
+  sendJson({
+    type: 'status',
+    startSeconds,
+    message: 'Starting MPEG1-TS stream (' + quality + 'p) at ' + startSeconds + 's...',
+  });
 
   const ffmpeg = spawn('ffmpeg', [
+    ...seekArgs(startSeconds),
     '-re', '-reconnect', '1', '-reconnect_at_eof', '1',
     '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
     '-i', inputUrl, '-an',

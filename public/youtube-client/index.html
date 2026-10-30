@@ -144,11 +144,16 @@ main{padding:14px 18px 30px}
     </div>
     <div class="watchctl">
       <button class="btn btn-stop" id="npStop">Stop</button>
+      <button class="btn" id="npResume" disabled>Resume</button>
       <button class="btn" id="btnBack10" disabled>&#8722;10s</button>
       <button class="btn" id="btnFwd10" disabled>+10s</button>
       <label for="vol">Sound</label>
       <input type="range" id="vol" min="0" max="100" value="100">
       <button class="btn" id="btnSync">Sync +2s</button>
+      <select id="audioMode" aria-label="Audio mode">
+        <option value="combined" selected>Sync audio</option>
+        <option value="separate">Compat audio</option>
+      </select>
       <select id="qualityWatch" aria-label="Quality">
         <option value="360">360p</option>
         <option value="480" selected>480p</option>
@@ -176,6 +181,7 @@ main{padding:14px 18px 30px}
   // was decoded. Seeking = restart both pipes at a new baseTimeSec.
   var playSeq = 0, durationSec = null, isLiveStream = false;
   var baseTimeSec = 0, streamStartedAtMs = null, scrubbing = false, seekInFlight = false;
+  var lastItem = null, lastPosSec = 0; // remembered on Stop so Resume can restart there
 
   var CHIPS = ['All', 'Music', 'Gaming', 'News', 'Live', 'Technology', 'Cars', 'Comedy', 'Sports', 'Science', 'Travel'];
   var AVATAR_COLORS = ['#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0', '#00838f', '#2e7d32', '#f9a825', '#ef6c00', '#4e342e', '#546e7a'];
@@ -358,13 +364,14 @@ main{padding:14px 18px 30px}
   // ===== MPEG1 playback (canvas + JSMpeg, separate MP3 audio pipe) =====
   function startVideo(token) {
     var quality = $('quality').value;
+    var useCombined = $('audioMode').value === 'combined';
     var wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host +
       '/ws/mpeg1?v=' + encodeURIComponent(curId) + '&quality=' + encodeURIComponent(quality) +
-      '&t=' + encodeURIComponent(baseTimeSec);
+      '&t=' + encodeURIComponent(baseTimeSec) + '&mode=' + encodeURIComponent($('audioMode').value);
     $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Starting video...';
     fpsCount = 0; lastFps = 0; $('npFps').textContent = '0 FPS';
     player = new JSMpeg.Player(wsUrl, {
-      canvas: nc, audio: false, streaming: true, maxBufferSize: 1024 * 1024,
+      canvas: nc, audio: useCombined, streaming: true, maxBufferSize: 4 * 1024 * 1024,
       pauseWhenHidden: false, preserveDrawingBuffer: true,
       onVideoDecode: function () {
         if (!player || token !== playSeq) return;
@@ -372,6 +379,12 @@ main{padding:14px 18px 30px}
           streamStartedAtMs = performance.now();
           seekInFlight = false;
           updateSeekUI();
+          // Combined mode: JSMpeg plays audio through WebAudio, which the
+          // browser may start suspended — resume it inside playback.
+          try {
+            if (player.audio && player.audio.context && player.audio.context.resume) player.audio.context.resume();
+            player.volume = $('vol').value / 100;
+          } catch (e) {}
         }
         fpsCount++;
         var now = Date.now();
@@ -387,6 +400,8 @@ main{padding:14px 18px 30px}
         $('npState').textContent = 'Ended';
         if (durationSec != null) { baseTimeSec = durationSec; streamStartedAtMs = null; }
         seekInFlight = false;
+        lastItem = null; lastPosSec = 0;
+        $('npResume').disabled = true;
         updateSeekUI();
       }
     });
@@ -416,6 +431,7 @@ main{padding:14px 18px 30px}
     $('npTitle').textContent = it.title || it.id;
     $('npChannel').textContent = it.channel || '';
     $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Buffering audio...';
+    $('npResume').disabled = true;
     updateSeekUI();
 
     // If the grid item had no duration, fetch it so seeking can unlock.
@@ -428,8 +444,15 @@ main{padding:14px 18px 30px}
       }).catch(function () {});
     }
 
-    // Audio first (MP3 pipe, restarted at baseTimeSec); video waits for it,
-    // like the original client.
+    // Combined mode: audio is muxed into the video stream and decoded by
+    // JSMpeg from the same timestamps — no second pipe, nothing to drift.
+    // The Sync button only applies to the separate pipe, so disable it.
+    var combined = $('audioMode').value === 'combined';
+    $('btnSync').disabled = combined;
+    if (combined) { startVideo(token); return; }
+
+    // Separate (compat) mode: audio first (MP3 pipe, restarted at
+    // baseTimeSec); video waits for it, like the original client.
     na.preload = 'none';
     na.src = '/api/audio?v=' + encodeURIComponent(it.id) + '&t=' + encodeURIComponent(baseTimeSec) + '&_=' + Date.now();
     na.load();
@@ -468,20 +491,42 @@ main{padding:14px 18px 30px}
   function play(it) { startPlayback(it, 0); }
 
   function stopPlayback() {
+    // Remember where we were: with restart-based playback, "pause" can
+    // only mean stop the pipes and restart them at the same position.
+    if (cur) { lastItem = cur; lastPosSec = currentPosition(); }
     playSeq++;
     teardownStreams();
     cur = null; curId = null;
     durationSec = null; isLiveStream = false;
     baseTimeSec = 0; streamStartedAtMs = null; seekInFlight = false; scrubbing = false;
-    $('npState').textContent = 'Stopped';
+    $('npResume').disabled = !lastItem;
+    $('npState').textContent = lastItem ? 'Stopped at ' + fmtDur(lastPosSec) + ' — tap Resume' : 'Stopped';
     updateSeekUI();
   }
 
+  function resumePlayback() {
+    if (!lastItem) return;
+    var it = lastItem, pos = lastPosSec;
+    lastItem = null; lastPosSec = 0;
+    startPlayback(it, pos);
+  }
+
   $('npStop').onclick = stopPlayback;
+  $('npResume').onclick = resumePlayback;
   $('btnBack').onclick = showHome;
   $('logoHome').onclick = function () { if ($('watchView').style.display === 'block') showHome(); };
   $('btnSync').onclick = function () { try { na.currentTime = Math.min(na.currentTime + 2, na.duration || 999); } catch (e) {} };
-  $('vol').oninput = function () { na.volume = this.value / 100; };
+  $('vol').oninput = function () {
+    na.volume = this.value / 100;
+    if (player && $('audioMode').value === 'combined') { try { player.volume = this.value / 100; } catch (e) {} }
+  };
+  $('audioMode').onchange = function () { if (cur) startPlayback(cur, currentPosition()); };
+  // Tap on the picture also unlocks WebAudio in combined mode.
+  nc.onclick = function () {
+    try {
+      if (player && player.audio && player.audio.context && player.audio.context.resume) player.audio.context.resume();
+    } catch (e) {}
+  };
   $('btnBack10').onclick = function () { seekBy(-10); };
   $('btnFwd10').onclick = function () { seekBy(10); };
   $('seek').oninput = function () {

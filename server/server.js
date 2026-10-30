@@ -357,7 +357,12 @@ wss.on('connection', async (ws, req) => {
     ws.close();
     return;
   }
+  // mode=combined: audio is muxed into the same MPEG-TS as MP2 and decoded
+  // by JSMpeg — one stream, one clock, inherently in sync.
+  // mode=separate (default): video only here; audio comes from /api/audio.
+  const combined = params.get('mode') === 'combined';
   let inputUrl = null;
+  let audioUrl = null;
 
   const direct = params.get('url');
   const videoId = params.get('v');
@@ -367,8 +372,20 @@ wss.on('connection', async (ws, req) => {
   } else if (videoId && VIDEO_ID_RE.test(videoId)) {
     sendJson({ type: 'status', message: 'Resolving YouTube video...' });
     try {
-      inputUrl = await resolveStream(videoId,
-        'bestvideo[height<=' + quality + '][ext=mp4]/bestvideo[height<=' + quality + ']/bestvideo/best');
+      const videoFormat = 'bestvideo[height<=' + quality + '][ext=mp4]/bestvideo[height<=' + quality + ']/bestvideo/best';
+      if (combined) {
+        // Resolve both pipes up front so they start from the same offset
+        // at the same moment — the separate-pipe mode can drift because
+        // the audio pipe starts seconds before the video pipe exists.
+        const pair = await Promise.all([
+          resolveStream(videoId, videoFormat),
+          resolveStream(videoId, 'bestaudio[ext=m4a]/bestaudio/best'),
+        ]);
+        inputUrl = pair[0];
+        audioUrl = pair[1];
+      } else {
+        inputUrl = await resolveStream(videoId, videoFormat);
+      }
     } catch (e) {
       sendJson({ type: 'error', error: e.type || 'resolve-failed',
         message: e.type === 'bot-blocked'
@@ -387,40 +404,87 @@ wss.on('connection', async (ws, req) => {
   sendJson({
     type: 'status',
     startSeconds,
-    message: 'Starting MPEG1-TS stream (' + quality + 'p) at ' + startSeconds + 's...',
+    mode: combined ? 'combined' : 'separate',
+    message: 'Starting MPEG1-TS stream (' + quality + 'p, ' +
+      (combined ? 'combined A/V' : 'video only') + ') at ' + startSeconds + 's...',
   });
 
-  const ffmpeg = spawn('ffmpeg', [
-    ...seekArgs(startSeconds),
-    '-re', '-reconnect', '1', '-reconnect_at_eof', '1',
-    '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
-    '-i', inputUrl, '-an',
-    '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
-    '-bf', '0',
-    '-vf', 'fps=30,scale=' + q.scale,
-    '-f', 'mpegts',
-    '-muxdelay', '0.1', '-muxpreload', '0',
-    '-',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const reconnectArgs = ['-re', '-reconnect', '1', '-reconnect_at_eof', '1',
+    '-reconnect_streamed', '1', '-reconnect_delay_max', '30'];
+  let ffmpegArgs;
+  if (combined && audioUrl) {
+    // One ffmpeg, two inputs seeked to the same offset, one output stream:
+    // video MPEG1 + audio MP2 muxed together. JSMpeg decodes both from the
+    // same timestamps, so lip sync is exact by construction.
+    ffmpegArgs = [
+      ...seekArgs(startSeconds), ...reconnectArgs, '-i', inputUrl,
+      ...seekArgs(startSeconds), ...reconnectArgs, '-i', audioUrl,
+      '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
+      '-bf', '0', '-g', '30',
+      '-vf', 'fps=30,scale=' + q.scale,
+      '-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+      '-f', 'mpegts',
+      '-muxdelay', '0.1', '-muxpreload', '0',
+      '-',
+    ];
+  } else if (combined) {
+    // Direct media URL: audio (if any) lives in the same source.
+    ffmpegArgs = [
+      ...seekArgs(startSeconds), ...reconnectArgs, '-i', inputUrl,
+      '-map', '0:v:0', '-map', '0:a:0?',
+      '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
+      '-bf', '0', '-g', '30',
+      '-vf', 'fps=30,scale=' + q.scale,
+      '-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+      '-f', 'mpegts',
+      '-muxdelay', '0.1', '-muxpreload', '0',
+      '-',
+    ];
+  } else {
+    ffmpegArgs = [
+      ...seekArgs(startSeconds), ...reconnectArgs, '-i', inputUrl, '-an',
+      '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
+      '-bf', '0', '-g', '30',
+      '-vf', 'fps=30,scale=' + q.scale,
+      '-f', 'mpegts',
+      '-muxdelay', '0.1', '-muxpreload', '0',
+      '-',
+    ];
+  }
+  const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
+  // Backpressure: if the client falls behind, PAUSE ffmpeg's output pipe
+  // instead of dropping chunks. Dropping MPEG1 chunks corrupts the picture
+  // until the next keyframe (visible smearing/freezing); pausing lets TCP
+  // and the pipe throttle the encoder to what the client can consume.
+  let bpTimer = null;
   ffmpeg.stdout.on('data', (chunk) => {
-    if (ws.readyState === 1) {
-      // Basic backpressure guard: if the client is >8 MB behind, drop this
-      // chunk rather than growing memory without bound. MPEG-TS/JSMpeg
-      // resyncs on the next packet boundary.
-      if (ws.bufferedAmount < 8 * 1024 * 1024) {
-        try { ws.send(chunk); } catch (e) {}
-      }
+    if (ws.readyState !== 1) return;
+    try { ws.send(chunk); } catch (e) {}
+    if (ws.bufferedAmount > 4 * 1024 * 1024 && !bpTimer) {
+      ffmpeg.stdout.pause();
+      bpTimer = setInterval(() => {
+        if (ws.readyState !== 1 || ws.bufferedAmount < 1024 * 1024) {
+          clearInterval(bpTimer); bpTimer = null;
+          try { ffmpeg.stdout.resume(); } catch (e) {}
+        }
+      }, 100);
     }
   });
   ffmpeg.stderr.on('data', () => {});
   ffmpeg.on('error', (e) => { sendJson({ type: 'error', message: e.message.slice(0, 120) }); });
   ffmpeg.on('close', (code) => {
+    if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
     sendJson({ type: 'status', message: 'Stream ended (code ' + code + ')' });
     try { ws.close(); } catch (e) {}
   });
-  ws.on('close', () => { try { ffmpeg.kill(); } catch (e) {} });
-  ws.on('error', () => { try { ffmpeg.kill(); } catch (e) {} });
+  const killFfmpeg = () => {
+    if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
+    try { ffmpeg.kill(); } catch (e) {}
+  };
+  ws.on('close', killFfmpeg);
+  ws.on('error', killFfmpeg);
 });
 
 server.listen(PORT, HOST, () => {

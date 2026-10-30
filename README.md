@@ -206,9 +206,14 @@ QtWebEngine) cannot do here.
 
 ## Known limits
 
-- **Audio delay:** the separate MP3 pipe buffers ~5 s. The client
-  compensates and offers Sync +2s, but perfect lip sync is not achievable
-  with two independent pipes.
+- **Audio sync:** the client defaults to *Sync audio* (combined) mode —
+  the server muxes audio (MP2) into the same MPEG-TS as the video and
+  JSMpeg decodes both from the same timestamps, so lip sync is exact by
+  construction. The original two-pipe design remains as *Compat audio*
+  mode (separate MP3 pipe, ~5 s buffer delay, Sync +2s compensation) in
+  case a browser won't play JSMpeg/WebAudio sound. Also note **Stop is a
+  restart-pause**: it remembers the position and **Resume** restarts the
+  stream at that position; resuming takes a few seconds, like a seek.
 - **YouTube bot-blocks datacenter IPs.** From a cloud VM, yt-dlp often
   gets *"Sign in to confirm you're not a bot"* (LOGIN_REQUIRED) and no
   stream can be resolved — search/info/audio all fail the same way. The

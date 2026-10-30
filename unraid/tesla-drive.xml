@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>tesla-drive</Name>
+  <!--
+    IMPORTANT: Unraid's Docker tab pulls an IMAGE from a registry; it cannot
+    build from this git repo directly. Two ways to get an image name to put
+    in <Repository> below:
+      1. Easiest on Unraid: install the "Compose Manager" plugin and use this
+         repo's docker-compose.yml — no registry needed (Unraid builds the
+         image locally from the Dockerfile).
+      2. Docker-tab route: build and push the image yourself, e.g.
+             docker build -t ghcr.io/YOUR-USERNAME/tesla-drive:latest .
+             docker push ghcr.io/YOUR-USERNAME/tesla-drive:latest
+         then replace the Repository value below with that image name.
+  -->
+  <Repository>ghcr.io/YOUR-USERNAME/tesla-drive:latest</Repository>
+  <Registry>https://ghcr.io/</Registry>
+  <Network>bridge</Network>
+  <Support>https://github.com/madpowah/tesla-video-drive</Support>
+  <Project>https://github.com/madpowah/tesla-video-drive</Project>
+  <Overview>YouTube in the Tesla browser while the car is in Drive, for passengers. Tesla pauses ordinary video elements at the OS level in Drive, so this app never uses one: a small home server resolves YouTube streams with yt-dlp, transcodes video to MPEG1-TS with ffmpeg, streams it over a WebSocket, and the web page decodes it in JavaScript/WebGL (JSMpeg) onto a canvas. Audio travels as a separate MP3 stream. One container serves the YouTube-style front page, the search/trending APIs and the WebSocket on a single port. PASSENGER USE ONLY while the car is moving — the driver must never watch or interact with it, and you are responsible for your local laws. Do not expose this to the public internet without authentication; keep it on your LAN or reach it over Tailscale / a reverse proxy with auth.</Overview>
+  <Category>MediaApp:Video Network:Other</Category>
+  <WebUI>http://[IP]:[PORT:8742]/</WebUI>
+  <Privileged>false</Privileged>
+  <Config Name="WebUI and API Port" Target="8742" Default="8742" Mode="tcp" Description="The single port for the web front page, JSON APIs and the MPEG1 WebSocket (same origin)." Type="Port" Display="always" Required="true" Mask="false"/>
+  <Config Name="Config Directory" Target="/config" Default="/mnt/user/appdata/tesla-drive" Mode="rw" Description="Appdata folder. Optionally holds cookies.txt (Netscape format, exported from a browser signed in to YouTube) for when YouTube bot-blocks your IP. See config/cookies.txt.example in the repo." Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="Port" Target="PORT" Default="8742" Description="Port the app listens on inside the container." Type="Variable" Display="always" Required="false" Mask="false">8742</Config>
+  <Config Name="Bind Host" Target="HOST" Default="0.0.0.0" Description="Bind address inside the container. Keep 0.0.0.0 for Docker/Unraid (the port mapping controls exposure); bare-metal local use defaults to 127.0.0.1." Type="Variable" Display="always" Required="false" Mask="false">0.0.0.0</Config>
+  <Config Name="yt-dlp Cookies File" Target="YT_DLP_COOKIES" Default="/config/cookies.txt" Description="Optional. Path (inside the container) to a Netscape cookies.txt for yt-dlp. Only used when the file exists; leave as-is if you do not use cookies." Type="Variable" Display="always" Required="false" Mask="false">/config/cookies.txt</Config>
+</Container>

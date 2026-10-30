@@ -1,0 +1,17 @@
+# Optional yt-dlp cookies file — placeholder only, contains NO real cookies.
+#
+# You only need this if YouTube bot-blocks your server's IP and yt-dlp
+# reports "Sign in to confirm you're not a bot" (LOGIN_REQUIRED).
+#
+# How to create the real file:
+#   1. In a desktop browser where you are signed in to YouTube, install a
+#      "Get cookies.txt LOCALLY" style extension.
+#   2. Export cookies for youtube.com in Netscape format.
+#   3. Save the export as cookies.txt IN THIS FOLDER (next to this file),
+#      i.e. config/cookies.txt — it is git-ignored and mounted into the
+#      container at /config/cookies.txt.
+#   4. Restart the container/server. The server passes it to yt-dlp via
+#      --cookies (YT_DLP_COOKIES env var) only when the file exists.
+#
+# Treat cookies.txt like a password: it is a live YouTube login session.
+# Never commit it, never share it.

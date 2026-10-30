@@ -1,0 +1,37 @@
+# Tesla YouTube Drive — one container serving the frontend, the JSON APIs
+# and the MPEG1 WebSocket on a single port (8742).
+#
+#   docker compose up -d --build
+#   open http://<your-server>:8742/
+#
+# On Unraid: use the Compose Manager plugin with this file, or see
+# unraid/tesla-drive.xml for the Docker-tab template route.
+services:
+  tesla-drive:
+    build: .
+    image: tesla-drive:latest
+    container_name: tesla-drive
+    restart: unless-stopped
+    ports:
+      - "8742:8742"
+    environment:
+      PORT: "8742"
+      # Bind all interfaces INSIDE the container only; the published port
+      # above is what exposes it on your LAN. (Bare-metal default in the
+      # code is 127.0.0.1.)
+      HOST: "0.0.0.0"
+      # Optional: Netscape-format cookies file for yt-dlp, used when
+      # YouTube bot-blocks your IP ("Sign in to confirm you're not a
+      # bot"). Put the file at ./config/cookies.txt on the host (see
+      # config/cookies.txt.example). If the file does not exist the
+      # server simply runs without cookies.
+      YT_DLP_COOKIES: "/config/cookies.txt"
+    volumes:
+      # On Unraid point this at /mnt/user/appdata/tesla-drive instead.
+      - ./config:/config
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8742/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

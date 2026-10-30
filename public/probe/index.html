@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- Probe page adapted from tesla-video-drive by madpowah (MIT License) - https://github.com/madpowah/tesla-video-drive -->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Tesla Probe V2</title>
+<style>
+body{background:#0a0a0f;color:#e0e0e0;font-family:sans-serif;padding:15px;font-size:14px}
+h1{color:#00d4ff;text-align:center;font-size:1.2rem}
+.ok{color:#4ade80}
+.fail{color:#f87171}
+.gray{color:#888}
+.block{background:#0f0f1a;border:1px solid #2a2a3a;border-radius:8px;padding:10px;margin:8px 0}
+.mono{font-family:monospace;font-size:.7rem;color:#888;word-break:break-all}
+.r{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #141420;font-size:.78rem}
+.r:last-child{border-bottom:none}
+.l{color:#999}
+.btn{width:100%;padding:16px;background:#003366;border:none;border-radius:8px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;margin:4px 0}
+.btn:active{opacity:.6}
+</style>
+</head>
+<body>
+
+<h1>Tesla Probe V2</h1>
+
+<div id="status" class="block" style="text-align:center;font-weight:600;">
+  <span id="st">...</span>
+</div>
+
+<div id="section-ua" class="block">
+  <b>User-Agent</b><br>
+  <span id="ua" class="mono">...</span>
+</div>
+
+<div id="section-engine" class="block">
+  <b>Engine</b><br>
+  <span id="eng" class="mono">...</span>
+</div>
+
+<div id="section-apis" class="block">
+  <b>APIs</b><br>
+  <div id="apis" style="font-size:.78rem;"></div>
+</div>
+
+<div id="section-codecs" class="block">
+  <b>Codecs</b><br>
+  <span id="codecs" class="mono">...</span>
+</div>
+
+<div id="section-webgl" class="block">
+  <b>WebGL</b><br>
+  <span id="webgl" class="mono">...</span>
+</div>
+
+<div id="section-mic" class="block">
+  <b>Microphone</b>
+  <button class="btn" id="btnMic">TEST MICROPHONE</button>
+  <div id="micResult" class="mono" style="color:#888;"></div>
+</div>
+
+<button class="btn" id="btnReport">GENERATE REPORT</button>
+<div id="reportBox" class="mono" style="display:none;background:#050510;border-radius:6px;padding:8px;margin-top:4px;max-height:400px;overflow-y:auto"></div>
+
+<script>
+var st = document.getElementById('st');
+
+function setStatus(text, color) {
+  try { st.textContent = text; if (color) st.style.color = color; } catch (e) {}
+}
+
+setStatus('Testing...', '#4ade80');
+
+// ===== UA =====
+var uaStr = navigator.userAgent;
+document.getElementById('ua').textContent = uaStr;
+
+var isTesla = /QtCarBrowser|Tesla/i.test(uaStr);
+var isQt = /QtWebEngine/i.test(uaStr);
+setStatus(isTesla ? 'Tesla detected' : 'Standard browser', isTesla ? '#00d4ff' : '#4ade80');
+
+// ===== ENGINE =====
+var chromeVer = (uaStr.match(/Chrome\/(\d+)/) || [])[1] || '?';
+var webkitVer = (uaStr.match(/AppleWebKit\/(\d+)/) || [])[1] || '?';
+document.getElementById('eng').textContent =
+  'Chromium: ' + chromeVer + ' | WebKit: ' + webkitVer +
+  ' | Platform: ' + (navigator.platform || '?') +
+  ' | Vendor: ' + (navigator.vendor || '?') +
+  ' | Lang: ' + navigator.language +
+  ' | Cores: ' + (navigator.hardwareConcurrency || '?') +
+  ' | RAM: ' + (navigator.deviceMemory || '?') + ' GB' +
+  ' | Touch: ' + (navigator.maxTouchPoints || '?');
+
+// ===== API tests =====
+var apisList = [
+  ['getUserMedia', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)],
+  ['enumerateDevices', !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices)],
+  ['RTCPeerConnection', typeof RTCPeerConnection !== 'undefined' || typeof webkitRTCPeerConnection !== 'undefined'],
+  ['captureStream (canvas)', typeof HTMLCanvasElement !== 'undefined' && typeof HTMLCanvasElement.prototype.captureStream === 'function'],
+  ['PictureInPicture', !!document.pictureInPictureEnabled],
+  ['Fullscreen', !!(document.fullscreenEnabled || document.webkitFullscreenEnabled)],
+  ['ServiceWorker', 'serviceWorker' in navigator],
+  ['WebSocket', typeof WebSocket !== 'undefined'],
+  ['AudioContext', typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined'],
+  ['MediaRecorder', typeof MediaRecorder !== 'undefined'],
+  ['WebAssembly', typeof WebAssembly !== 'undefined'],
+  ['Geolocation', 'geolocation' in navigator],
+  ['VideoDecoder (WebCodecs)', typeof VideoDecoder !== 'undefined'],
+  ['VideoFrame', typeof VideoFrame !== 'undefined'],
+  ['EncodedVideoChunk', typeof EncodedVideoChunk !== 'undefined'],
+  ['MediaStreamTrackProcessor', typeof MediaStreamTrackProcessor !== 'undefined'],
+  ['MediaStreamTrackGenerator', typeof MediaStreamTrackGenerator !== 'undefined'],
+  ['requestVideoFrameCallback', typeof HTMLVideoElement !== 'undefined' && typeof HTMLVideoElement.prototype.requestVideoFrameCallback === 'function'],
+  ['createImageBitmap', typeof createImageBitmap !== 'undefined'],
+  ['RTCRtpScriptTransform (insertable streams)', typeof RTCRtpScriptTransform !== 'undefined'],
+];
+var apiHtml = '';
+for (var i = 0; i < apisList.length; i++) {
+  var name = apisList[i][0];
+  var ok = apisList[i][1];
+  apiHtml += '<div class="r"><span class="l">' + name + '</span><span class="v ' + (ok ? 'ok' : 'fail') + '">' + (ok ? 'YES' : 'NO') + '</span></div>';
+}
+document.getElementById('apis').innerHTML = apiHtml;
+
+// ===== CODECS =====
+try {
+  var v = document.createElement('video');
+  var c = '';
+  c += 'H.264:' + v.canPlayType('video/mp4; codecs="avc1.42E01E"') + ' ';
+  c += 'H.265:' + v.canPlayType('video/mp4; codecs="hev1.1.6.L120.90"') + ' ';
+  c += 'VP8:' + v.canPlayType('video/webm; codecs="vp8"') + ' ';
+  c += 'VP9:' + v.canPlayType('video/webm; codecs="vp9"');
+  document.getElementById('codecs').textContent = c;
+} catch (e) {
+  document.getElementById('codecs').textContent = 'Error: ' + e.message;
+}
+
+// ===== WEBGL =====
+try {
+  var c = document.createElement('canvas');
+  var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+  if (gl) {
+    var di = gl.getExtension('WEBGL_debug_renderer_info');
+    var w = 'WebGL: OK | WebGL2: ' + !!c.getContext('webgl2');
+    if (di) w += ' | GPU: ' + gl.getParameter(di.UNMASKED_RENDERER_WEBGL);
+    document.getElementById('webgl').textContent = w;
+  } else {
+    document.getElementById('webgl').textContent = 'WebGL: NOT available';
+  }
+} catch (e) {
+  document.getElementById('webgl').textContent = 'WebGL Error: ' + e.message;
+}
+
+setStatus('Diagnostic complete', '#4ade80');
+
+// ===== MIC TEST =====
+document.getElementById('btnMic').onclick = function () {
+  var mr = document.getElementById('micResult');
+  mr.textContent = 'Testing...';
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(function (stream) {
+        mr.textContent = 'Microphone OK! Label: ' + (stream.getAudioTracks()[0].label || '?');
+        stream.getTracks().forEach(function (t) { t.stop(); });
+      })
+      .catch(function (err) {
+        mr.textContent = err.name + ': ' + err.message.substring(0, 80);
+      });
+  } else {
+    mr.textContent = 'getUserMedia not available';
+  }
+};
+
+// ===== REPORT =====
+document.getElementById('btnReport').onclick = function () {
+  var rp = document.getElementById('reportBox');
+  rp.style.display = 'block';
+  rp.textContent = [
+    '=== TESLA PROBE REPORT ===',
+    'Timestamp: ' + new Date().toISOString(),
+    'User-Agent: ' + uaStr,
+    'isTesla: ' + isTesla,
+    'isQtWebEngine: ' + isQt,
+    'Chrome: ' + chromeVer,
+    'WebKit: ' + webkitVer,
+    'Platform: ' + (navigator.platform || '?'),
+    'Cores: ' + (navigator.hardwareConcurrency || '?'),
+    'RAM: ' + (navigator.deviceMemory || '?') + ' GB',
+    'Screen: ' + screen.width + 'x' + screen.height,
+    'TouchPoints: ' + (navigator.maxTouchPoints || '?'),
+    '',
+    'APIs: ',
+    ...apisList.map(function (a) { return '  ' + a[0] + ': ' + (a[1] ? 'YES' : 'NO'); }),
+    '',
+    'Codecs: ' + (document.getElementById('codecs').textContent || '?'),
+    'WebGL: ' + (document.getElementById('webgl').textContent || '?'),
+    '',
+    '=== WebRTC / WebCodecs (video bypass potential) ===',
+    'captureStream: ' + (typeof HTMLCanvasElement !== 'undefined' && typeof HTMLCanvasElement.prototype.captureStream === 'function'),
+    'VideoFrame: ' + (typeof VideoFrame !== 'undefined'),
+    'MediaStreamTrackProcessor: ' + (typeof MediaStreamTrackProcessor !== 'undefined'),
+    'requestVideoFrameCallback: ' + (typeof HTMLVideoElement !== 'undefined' && typeof HTMLVideoElement.prototype.requestVideoFrameCallback === 'function'),
+    'VideoDecoder: ' + (typeof VideoDecoder !== 'undefined'),
+    'ImageBitmap: ' + (typeof createImageBitmap !== 'undefined'),
+  ].join('\n');
+  this.textContent = 'REPORT READY';
+};
+
+// Auto-submit probe data to server if on Tesla
+if (isTesla && navigator.sendBeacon) {
+  setTimeout(function () {
+    try {
+      var data = JSON.stringify({
+        ua: uaStr, isTesla: true,
+        chromeVer: chromeVer,
+        cores: navigator.hardwareConcurrency,
+        ram: navigator.deviceMemory,
+        screen: screen.width + 'x' + screen.height,
+        ts: new Date().toISOString()
+      });
+      navigator.sendBeacon('/api/probe-report', data);
+    } catch (e) {}
+  }, 3000);
+}
+</script>
+</body>
+</html>

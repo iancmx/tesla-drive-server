@@ -1,0 +1,15 @@
+node_modules
+.git
+.gitignore
+.env
+config/*
+!config/.gitkeep
+!config/cookies.txt.example
+probe-reports
+test
+*.log
+Dockerfile
+docker-compose.yml
+.dockerignore
+unraid
+README.md

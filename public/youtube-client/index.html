@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>TeslaDrive — YouTube for Tesla</title>
+<!--
+  TeslaDrive YouTube client.
+  Playback architecture adapted from tesla-video-drive by madpowah (MIT)
+  https://github.com/madpowah/tesla-video-drive
+
+  There is deliberately NO video element on this page: Tesla pauses those
+  at the OS level in Drive. Video is MPEG1-TS over WebSocket, decoded by
+  JSMpeg (JS/WebGL) onto a canvas; audio is a separate MP3 stream in an
+  audio element (not blocked in Drive).
+  PASSENGER USE ONLY while the car is moving.
+-->
+<style>
+:root{--bg:#0f0f0f;--surface:#212121;--chip:#272727;--chip-hover:#3d3d3d;--border:#303030;--text:#f1f1f1;--sub:#aaa;--red:#ff0033}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scrollbar-color:#4d4d4d var(--bg)}
+body{font-family:Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:15px;min-height:100vh}
+button{font-family:inherit;color:var(--text);background:none;border:none;cursor:pointer}
+button:active{opacity:.65}
+
+/* ---- header ---- */
+header{position:sticky;top:0;z-index:50;background:var(--bg);display:flex;align-items:center;gap:18px;padding:10px 18px}
+.logo{display:flex;align-items:center;gap:8px;flex:none;cursor:pointer;min-height:44px}
+.logo .play{width:34px;height:24px;background:var(--red);border-radius:6px;position:relative;flex:none}
+.logo .play::after{content:"";position:absolute;left:13px;top:6px;border-style:solid;border-width:6px 0 6px 10px;border-color:transparent transparent transparent #fff}
+.logo .wordmark{font-size:20px;font-weight:700;letter-spacing:-.6px;white-space:nowrap}
+.searchwrap{flex:1;display:flex;justify-content:center}
+.searchpill{display:flex;width:100%;max-width:640px;height:46px;background:#121212;border:1px solid var(--border);border-radius:999px;overflow:hidden}
+.searchpill input{flex:1;min-width:0;background:transparent;border:0;outline:none;color:var(--text);font-size:16px;padding:0 18px}
+.searchpill input::placeholder{color:#888}
+.searchpill button{width:74px;flex:none;background:#222;border-left:1px solid var(--border);display:flex;align-items:center;justify-content:center;min-height:44px}
+.searchpill button svg{width:22px;height:22px;fill:var(--text)}
+.headctl{display:flex;gap:8px;flex:none;align-items:center}
+select{background:#121212;color:var(--text);border:1px solid var(--border);border-radius:8px;height:44px;padding:0 8px;font-size:14px}
+.safety{text-align:center;color:#ffb020;font-size:12.5px;padding:5px 12px;border-bottom:1px solid #262626}
+
+/* ---- chips ---- */
+.chips{display:flex;gap:10px;padding:12px 18px 4px;overflow-x:auto;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;background:var(--chip);border-radius:8px;padding:11px 16px;font-size:14px;font-weight:500;min-height:42px;white-space:nowrap}
+.chip.active{background:#f1f1f1;color:#0f0f0f}
+
+/* ---- home grid ---- */
+main{padding:14px 18px 30px}
+.statusline{color:var(--sub);font-size:13.5px;min-height:18px;margin-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:30px 16px}
+.card{cursor:pointer}
+.card:active{transform:scale(.985)}
+.thumbwrap{position:relative;border-radius:12px;overflow:hidden;background:#1f1f1f;aspect-ratio:16/9}
+.thumbwrap img{width:100%;height:100%;display:block;object-fit:cover}
+.durbadge{position:absolute;right:6px;bottom:6px;background:rgba(0,0,0,.85);color:#fff;font-size:12.5px;font-weight:500;padding:2px 5px;border-radius:4px}
+.cardmeta{display:flex;gap:12px;margin-top:12px}
+.avatar{width:36px;height:36px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:15px;color:#fff}
+.cardtext{min-width:0}
+.cardtitle{font-size:15.5px;font-weight:500;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.cardsub{color:var(--sub);font-size:13.5px;margin-top:3px;line-height:1.45;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.state{grid-column:1/-1;text-align:center;color:var(--sub);font-size:15.5px;padding:46px 16px;line-height:1.5}
+.state.err{color:#ff7b7b}
+.skel .thumbwrap,.skel .skline{background:#1c1c1c;animation:pulse 1.3s ease-in-out infinite}
+.skel .skline{height:14px;border-radius:4px;margin-top:12px}
+.skel .skline.short{width:55%;margin-top:7px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* ---- watch view ---- */
+#watchView{display:none;max-width:1180px;margin:0 auto}
+.backbtn{display:inline-flex;align-items:center;gap:8px;background:var(--chip);border-radius:999px;padding:11px 18px;font-size:15px;font-weight:500;min-height:44px;margin-bottom:14px}
+.canvaswrap{background:#000;border-radius:12px;overflow:hidden}
+#nc{width:100%;display:block;background:#000}
+.watchtitle{font-size:20px;font-weight:600;line-height:1.35;margin-top:14px}
+.watchchannel{color:var(--sub);font-size:14.5px;margin-top:5px}
+.watchctl{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px;background:var(--surface);border-radius:12px;padding:10px 14px}
+.watchctl .btn{background:#3d3d3d;border-radius:999px;padding:11px 18px;font-size:14.5px;font-weight:500;min-height:44px}
+.watchctl .btn-stop{background:#600}
+.watchctl label{color:var(--sub);font-size:13.5px}
+.watchctl input[type=range]{flex:1;min-width:110px;accent-color:var(--red);height:28px}
+.watchctl select{height:44px}
+.npstate{color:var(--sub);font-size:14px}
+#npFps{color:#4caf50;font-weight:600;font-size:14px}
+@media (max-width:640px){
+  .logo .wordmark{display:none}
+  header{gap:10px;padding:8px 12px}
+  main{padding:12px 12px 26px}
+  .grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo" id="logoHome" title="TeslaDrive home">
+    <div class="play"></div><div class="wordmark">TeslaDrive</div>
+  </div>
+  <div class="searchwrap">
+    <div class="searchpill">
+      <input id="q" type="text" placeholder="Search" autocomplete="off">
+      <button id="btnSearch" aria-label="Search">
+        <svg viewBox="0 0 24 24"><path d="M20.87 20.17l-5.59-5.59A8.5 8.5 0 1 0 14.28 15.28l5.59 5.59a.5.5 0 0 0 .7 0l.3-.3a.5.5 0 0 0 0-.7zM5 10.5a5.5 5.5 0 1 1 11 0 5.5 5.5 0 0 1-11 0z"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="headctl">
+    <select id="region" aria-label="Region">
+      <option value="US" selected>US</option><option value="CA">CA</option>
+      <option value="GB">GB</option><option value="DE">DE</option>
+      <option value="JP">JP</option><option value="AU">AU</option>
+    </select>
+    <select id="quality" aria-label="Quality">
+      <option value="360">360p</option>
+      <option value="480" selected>480p</option>
+      <option value="720">720p</option>
+    </select>
+  </div>
+</header>
+<div class="safety">Passenger use only while the car is moving — the driver must never watch or operate this.</div>
+
+<div id="homeView">
+  <div class="chips" id="chips"></div>
+  <main>
+    <div class="statusline" id="statusLine"></div>
+    <div class="grid" id="grid"></div>
+  </main>
+</div>
+
+<div id="watchView">
+  <main>
+    <button class="backbtn" id="btnBack">&#8592; Back</button>
+    <div class="canvaswrap"><canvas id="nc" width="854" height="480"></canvas></div>
+    <div class="watchtitle" id="npTitle">—</div>
+    <div class="watchchannel" id="npChannel"></div>
+    <div class="watchctl">
+      <button class="btn btn-stop" id="npStop">Stop</button>
+      <label for="vol">Sound</label>
+      <input type="range" id="vol" min="0" max="100" value="100">
+      <button class="btn" id="btnSync">Sync +2s</button>
+      <select id="qualityWatch" aria-label="Quality">
+        <option value="360">360p</option>
+        <option value="480" selected>480p</option>
+        <option value="720">720p</option>
+      </select>
+      <span class="npstate" id="npState">Idle</span>
+      <span id="npFps">0 FPS</span>
+    </div>
+  </main>
+</div>
+
+<audio id="na" style="display:none"></audio>
+
+<script src="jsmpeg.min.js"></script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var nc = $('nc'), na = $('na');
+  var player = null, cur = null, curId = null;
+  var fpsCount = 0, lastFps = 0, syncTimer = null, forceTimer = null;
+  var homeScroll = 0, activeChip = 'All';
+
+  var CHIPS = ['All', 'Music', 'Gaming', 'News', 'Live', 'Technology', 'Cars', 'Comedy', 'Sports', 'Science', 'Travel'];
+  var AVATAR_COLORS = ['#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0', '#00838f', '#2e7d32', '#f9a825', '#ef6c00', '#4e342e', '#546e7a'];
+
+  function setStatus(t) { $('statusLine').textContent = t; }
+  function fmtDur(s) {
+    if (s == null) return '';
+    s = Math.round(s); var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+    return (h ? h + ':' : '') + (h && m < 10 ? '0' : '') + m + ':' + (ss < 10 ? '0' : '') + ss;
+  }
+  function fmtViews(n) {
+    if (n == null) return '';
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M views';
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K views';
+    return n + ' views';
+  }
+  function avatarColor(name) {
+    var h = 0; name = String(name || '?');
+    for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return AVATAR_COLORS[h % AVATAR_COLORS.length];
+  }
+  function thumb(id, img) {
+    img.src = 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg';
+    img.onerror = function () {
+      if (img.src.indexOf('hqdefault') >= 0) img.src = 'https://i.ytimg.com/vi/' + id + '/mqdefault.jpg';
+      else img.onerror = null;
+    };
+  }
+
+  // ---- home grid ----
+  function renderSkeletons(n) {
+    var grid = $('grid'); grid.innerHTML = '';
+    for (var i = 0; i < n; i++) {
+      var d = document.createElement('div'); d.className = 'card skel';
+      var tw = document.createElement('div'); tw.className = 'thumbwrap';
+      var l1 = document.createElement('div'); l1.className = 'skline';
+      var l2 = document.createElement('div'); l2.className = 'skline short';
+      d.appendChild(tw); d.appendChild(l1); d.appendChild(l2);
+      grid.appendChild(d);
+    }
+  }
+  function renderState(msg, isErr) {
+    var grid = $('grid'); grid.innerHTML = '';
+    var d = document.createElement('div');
+    d.className = 'state' + (isErr ? ' err' : '');
+    d.textContent = msg;
+    grid.appendChild(d);
+  }
+  function renderResults(items, label) {
+    var grid = $('grid'); grid.innerHTML = '';
+    if (!items || !items.length) {
+      setStatus(label + ': no results');
+      renderState('No videos found. Try a different search.', false);
+      return;
+    }
+    setStatus(label + ': ' + items.length + ' videos');
+    items.forEach(function (it) {
+      if (!/^[A-Za-z0-9_-]{11}$/.test(it.id)) return;
+      var card = document.createElement('div'); card.className = 'card';
+      var tw = document.createElement('div'); tw.className = 'thumbwrap';
+      var img = document.createElement('img'); img.alt = ''; thumb(it.id, img);
+      tw.appendChild(img);
+      var dur = fmtDur(it.duration);
+      if (dur) {
+        var badge = document.createElement('span'); badge.className = 'durbadge';
+        badge.textContent = dur; tw.appendChild(badge);
+      }
+      var meta = document.createElement('div'); meta.className = 'cardmeta';
+      var av = document.createElement('div'); av.className = 'avatar';
+      av.style.background = avatarColor(it.channel);
+      av.textContent = (String(it.channel || '?').trim().charAt(0) || '?').toUpperCase();
+      var tx = document.createElement('div'); tx.className = 'cardtext';
+      var tt = document.createElement('div'); tt.className = 'cardtitle'; tt.textContent = it.title || 'Untitled';
+      var s1 = document.createElement('div'); s1.className = 'cardsub'; s1.textContent = it.channel || '';
+      tx.appendChild(tt); tx.appendChild(s1);
+      var views = fmtViews(it.viewCount);
+      if (views) {
+        var s2 = document.createElement('div'); s2.className = 'cardsub'; s2.textContent = views;
+        tx.appendChild(s2);
+      }
+      meta.appendChild(av); meta.appendChild(tx);
+      card.appendChild(tw); card.appendChild(meta);
+      card.onclick = function () { play(it); };
+      grid.appendChild(card);
+    });
+  }
+
+  function getJson(url, label) {
+    setStatus(label + '...');
+    renderSkeletons(8);
+    fetch(url).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) {
+        setStatus(label + ' failed');
+        renderState(label + ' failed: ' + (d.error || 'error') +
+          (d.detail ? ' — ' + String(d.detail).slice(0, 160) : '') +
+          (d.attempts ? ' — ' + d.attempts.join('; ').slice(0, 200) : ''), true);
+        return;
+      }
+      renderResults(d.results, label + (d.source ? ' (' + d.source + ')' : ''));
+    }).catch(function (e) {
+      setStatus(label + ' failed');
+      renderState(label + ' failed: ' + e.message, true);
+    });
+  }
+  function loadTrending() { getJson('/api/trending?region=' + encodeURIComponent($('region').value), 'Trending'); }
+  function doSearch(qstr, label) {
+    var q = String(qstr || '').trim();
+    if (!q) { loadTrending(); return; }
+    getJson('/api/search?q=' + encodeURIComponent(q), label || 'Search');
+  }
+  function setActiveChip(name) {
+    activeChip = name;
+    var btns = $('chips').querySelectorAll('.chip');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].className = 'chip' + (btns[i].textContent === name ? ' active' : '');
+    }
+  }
+  (function buildChips() {
+    var wrap = $('chips');
+    CHIPS.forEach(function (name) {
+      var b = document.createElement('button');
+      b.className = 'chip' + (name === 'All' ? ' active' : '');
+      b.textContent = name;
+      b.onclick = function () {
+        setActiveChip(name);
+        if (name === 'All') loadTrending(); else doSearch(name, name);
+      };
+      wrap.appendChild(b);
+    });
+  })();
+
+  // ---- watch view switching ----
+  function showWatch() {
+    if ($('homeView').style.display !== 'none') homeScroll = window.scrollY || 0;
+    $('homeView').style.display = 'none';
+    $('watchView').style.display = 'block';
+    window.scrollTo(0, 0);
+  }
+  function showHome() {
+    stopPlayback();
+    $('watchView').style.display = 'none';
+    $('homeView').style.display = 'block';
+    var y = homeScroll;
+    requestAnimationFrame(function () { window.scrollTo(0, y); });
+  }
+
+  // ===== MPEG1 playback (canvas + JSMpeg, separate MP3 audio pipe) =====
+  function startVideo() {
+    var quality = $('quality').value;
+    var wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host +
+      '/ws/mpeg1?v=' + encodeURIComponent(curId) + '&quality=' + encodeURIComponent(quality);
+    $('npState').textContent = 'Starting video...';
+    fpsCount = 0; lastFps = 0; $('npFps').textContent = '0 FPS';
+    player = new JSMpeg.Player(wsUrl, {
+      canvas: nc, audio: false, streaming: true, maxBufferSize: 1024 * 1024,
+      pauseWhenHidden: false, preserveDrawingBuffer: true,
+      onVideoDecode: function () {
+        if (!player) return;
+        fpsCount++;
+        var now = Date.now();
+        if (now - lastFps >= 1000) {
+          $('npFps').textContent = fpsCount + ' FPS';
+          fpsCount = 0; lastFps = now;
+          $('npState').textContent = 'Playing';
+        }
+      },
+      onSourceEstablished: function () { $('npState').textContent = 'Connected'; },
+      onSourceCompleted: function () { $('npState').textContent = 'Ended'; }
+    });
+  }
+
+  function play(it) {
+    stopPlayback();
+    cur = it; curId = it.id;
+    showWatch();
+    var quality = $('quality').value;
+    var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720] }[quality] || [854, 480];
+    nc.width = dims[0]; nc.height = dims[1];
+    $('npTitle').textContent = it.title || it.id;
+    $('npChannel').textContent = it.channel || '';
+    $('npState').textContent = 'Buffering audio...';
+
+    // Audio first (MP3 pipe); video waits for it, like the original client.
+    na.preload = 'none';
+    na.src = '/api/audio?v=' + encodeURIComponent(it.id) + '&_=' + Date.now();
+    na.load();
+    (function tp() { if (curId) na.play().catch(function () { setTimeout(tp, 150); }); })();
+
+    // Keep an eye on the ~5s audio buffer: nudge forward once playing, and
+    // launch the video stream as soon as audio is actually playing.
+    var nudged = false;
+    syncTimer = setInterval(function () {
+      if (!curId) return;
+      if (!na.paused && na.readyState >= 2) {
+        if (!nudged && na.currentTime < 3) {
+          try { na.currentTime = Math.min(na.currentTime + 4, (na.duration || 999)); } catch (e) {}
+          nudged = true;
+        }
+      }
+      if (!player && !na.paused && na.readyState >= 2 && na.currentTime > 0) {
+        clearInterval(syncTimer); syncTimer = null;
+        startVideo();
+      }
+    }, 250);
+
+    // Timeout: force-start video after 10s even without audio.
+    forceTimer = setTimeout(function () {
+      if (!player && curId) { $('npState').textContent = 'Forced start (no audio yet)...'; startVideo(); }
+    }, 10000);
+  }
+
+  function stopPlayback() {
+    if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+    if (forceTimer) { clearTimeout(forceTimer); forceTimer = null; }
+    if (player) { try { player.destroy(); } catch (e) {} player = null; }
+    try { na.pause(); na.removeAttribute('src'); na.load(); } catch (e) {}
+    cur = null; curId = null;
+    $('npState').textContent = 'Stopped';
+  }
+
+  $('npStop').onclick = stopPlayback;
+  $('btnBack').onclick = showHome;
+  $('logoHome').onclick = function () { if ($('watchView').style.display === 'block') showHome(); };
+  $('btnSync').onclick = function () { try { na.currentTime = Math.min(na.currentTime + 2, na.duration || 999); } catch (e) {} };
+  $('vol').oninput = function () { na.volume = this.value / 100; };
+
+  function syncQuality(fromEl, toEl) {
+    toEl.value = fromEl.value;
+    if (cur) { var it = cur; play(it); }
+  }
+  $('quality').onchange = function () { syncQuality($('quality'), $('qualityWatch')); };
+  $('qualityWatch').onchange = function () { syncQuality($('qualityWatch'), $('quality')); };
+
+  $('btnSearch').onclick = function () { setActiveChip(''); doSearch($('q').value, 'Search'); };
+  $('q').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
+  $('region').onchange = function () { if (activeChip === 'All') loadTrending(); };
+
+  if (/QtCarBrowser|Tesla/i.test(navigator.userAgent)) setStatus('Tesla detected — loading trending...');
+  loadTrending();
+})();
+</script>
+</body>
+</html>

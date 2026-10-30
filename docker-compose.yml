@@ -26,6 +26,12 @@ services:
       # config/cookies.txt.example). If the file does not exist the
       # server simply runs without cookies.
       YT_DLP_COOKIES: "/config/cookies.txt"
+      # Optional built-in HTTPS: uncomment BOTH lines and put cert.pem /
+      # key.pem in ./config (see README "Running it for a car"). If you
+      # enable this, also change the healthcheck below to
+      # "https://localhost:8742/" with curl -k.
+      # TLS_CERT: "/config/cert.pem"
+      # TLS_KEY: "/config/key.pem"
     volumes:
       # On Unraid point this at /mnt/user/appdata/tesla-drive instead.
       - ./config:/config

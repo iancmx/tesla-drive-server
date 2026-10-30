@@ -188,6 +188,20 @@ ProxyTimeout 300
 
 - A tunnel (Cloudflare Tunnel, Tailscale Funnel, ngrok, …) works the same
   way, as long as it passes WebSocket upgrades through.
+- **Built-in HTTPS (alternative to a proxy):** set both `TLS_CERT` and
+  `TLS_KEY` to PEM file paths and the server itself serves HTTPS + WSS
+  on the same port (in Docker, drop `cert.pem`/`key.pem` into the
+  mounted `config/` folder and use `/config/cert.pem`,
+  `/config/key.pem`). A self-signed cert is fine for LAN testing —
+
+  ```
+  openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+  ```
+
+  — but the Tesla browser may refuse self-signed certificates, which is
+  why a proxy/tunnel with a publicly trusted cert remains the
+  recommended route for the car. The client picks `wss://`
+  automatically whenever the page itself is loaded over `https://`.
 - Serving it from a **residential/home connection is strongly
   recommended** — see the bot-block note below.
 

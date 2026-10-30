@@ -22,6 +22,7 @@
  */
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -329,7 +330,23 @@ app.get('/api/audio', async (req, res) => {
 // ==========================================================================
 // WebSocket: MPEG1-TS video (never a <video> element on the client)
 // ==========================================================================
-const server = http.createServer(app);
+// Optional built-in HTTPS: set BOTH TLS_CERT and TLS_KEY to PEM file
+// paths and the same port serves HTTPS + WSS instead of HTTP + WS.
+// (The more common setup is a reverse proxy / tunnel terminating TLS in
+// front of the plain-HTTP server — see README "HTTPS". A self-signed
+// cert works for LAN use, but the Tesla browser may refuse it.)
+const TLS_CERT = process.env.TLS_CERT || '';
+const TLS_KEY = process.env.TLS_KEY || '';
+let server, SCHEME = 'http';
+if (TLS_CERT && TLS_KEY) {
+  server = https.createServer({
+    cert: fs.readFileSync(TLS_CERT),
+    key: fs.readFileSync(TLS_KEY),
+  }, app);
+  SCHEME = 'https';
+} else {
+  server = http.createServer(app);
+}
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
@@ -489,8 +506,8 @@ wss.on('connection', async (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log('Tesla YouTube Drive running on http://' + HOST + ':' + PORT);
-  console.log('  Client : http://' + HOST + ':' + PORT + '/youtube-client/');
-  console.log('  Probe  : http://' + HOST + ':' + PORT + '/probe/');
+  console.log('Tesla YouTube Drive running on ' + SCHEME + '://' + HOST + ':' + PORT);
+  console.log('  Client : ' + SCHEME + '://' + HOST + ':' + PORT + '/youtube-client/');
+  console.log('  Probe  : ' + SCHEME + '://' + HOST + ':' + PORT + '/probe/');
   console.log('  yt-dlp : ' + YT_DLP + (YT_DLP_COOKIES ? ' (cookies file configured)' : ''));
 });

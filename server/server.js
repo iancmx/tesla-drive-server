@@ -379,6 +379,10 @@ wss.on('connection', async (ws, req) => {
   // by JSMpeg — one stream, one clock, inherently in sync.
   // mode=separate (default): video only here; audio comes from /api/audio.
   const combined = params.get('mode') === 'combined';
+  // live=1: the client knows the source is a live stream. Live stays
+  // realtime-paced; on-demand video is encoded as fast as the CPU allows
+  // (see inputArgs below) so the client can bank a buffer lead.
+  const isLive = params.get('live') === '1';
   let inputUrl = null;
   let audioUrl = null;
 
@@ -427,16 +431,27 @@ wss.on('connection', async (ws, req) => {
       (combined ? 'combined A/V' : 'video only') + ') at ' + startSeconds + 's...',
   });
 
-  const reconnectArgs = ['-re', '-reconnect', '1', '-reconnect_at_eof', '1',
-    '-reconnect_streamed', '1', '-reconnect_delay_max', '30'];
+  // Pacing: for on-demand YouTube videos, ffmpeg is deliberately NOT
+  // paced to realtime (no -re): it encodes as fast as the CPU allows, so
+  // during good network moments the client banks a buffer lead that
+  // carries playback through stalls. The backpressure below throttles
+  // the encoder once enough data is queued, so the burst is self-limiting.
+  // Live streams and direct ?url= sources stay paced — there is no
+  // "ahead" to run to, and unpaced reads of a live edge just buffer-spin.
+  const pacedRealtime = !!direct || isLive;
+  const inputArgs = [
+    ...(pacedRealtime ? ['-re'] : []),
+    '-reconnect', '1', '-reconnect_at_eof', '1',
+    '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
+  ];
   let ffmpegArgs;
   if (combined && audioUrl) {
     // One ffmpeg, two inputs seeked to the same offset, one output stream:
     // video MPEG1 + audio MP2 muxed together. JSMpeg decodes both from the
     // same timestamps, so lip sync is exact by construction.
     ffmpegArgs = [
-      ...seekArgs(startSeconds), ...reconnectArgs, '-i', inputUrl,
-      ...seekArgs(startSeconds), ...reconnectArgs, '-i', audioUrl,
+      ...seekArgs(startSeconds), ...inputArgs, '-i', inputUrl,
+      ...seekArgs(startSeconds), ...inputArgs, '-i', audioUrl,
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
       '-bf', '0', '-g', '30',
@@ -449,7 +464,7 @@ wss.on('connection', async (ws, req) => {
   } else if (combined) {
     // Direct media URL: audio (if any) lives in the same source.
     ffmpegArgs = [
-      ...seekArgs(startSeconds), ...reconnectArgs, '-i', inputUrl,
+      ...seekArgs(startSeconds), ...inputArgs, '-i', inputUrl,
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
       '-bf', '0', '-g', '30',
@@ -461,7 +476,7 @@ wss.on('connection', async (ws, req) => {
     ];
   } else {
     ffmpegArgs = [
-      ...seekArgs(startSeconds), ...reconnectArgs, '-i', inputUrl, '-an',
+      ...seekArgs(startSeconds), ...inputArgs, '-i', inputUrl, '-an',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
       '-bf', '0', '-g', '30',
       '-vf', 'fps=30,scale=' + q.scale,
@@ -475,15 +490,17 @@ wss.on('connection', async (ws, req) => {
   // Backpressure: if the client falls behind, PAUSE ffmpeg's output pipe
   // instead of dropping chunks. Dropping MPEG1 chunks corrupts the picture
   // until the next keyframe (visible smearing/freezing); pausing lets TCP
-  // and the pipe throttle the encoder to what the client can consume.
+  // and the pipe throttle the encoder to what the client can consume. The
+  // window is deliberately wide (pause at 16 MB queued, resume at 4 MB)
+  // so an unpaced VOD encode can bank a real buffer lead in the client.
   let bpTimer = null;
   ffmpeg.stdout.on('data', (chunk) => {
     if (ws.readyState !== 1) return;
     try { ws.send(chunk); } catch (e) {}
-    if (ws.bufferedAmount > 4 * 1024 * 1024 && !bpTimer) {
+    if (ws.bufferedAmount > 16 * 1024 * 1024 && !bpTimer) {
       ffmpeg.stdout.pause();
       bpTimer = setInterval(() => {
-        if (ws.readyState !== 1 || ws.bufferedAmount < 1024 * 1024) {
+        if (ws.readyState !== 1 || ws.bufferedAmount < 4 * 1024 * 1024) {
           clearInterval(bpTimer); bpTimer = null;
           try { ffmpeg.stdout.resume(); } catch (e) {}
         }

@@ -241,6 +241,16 @@ QtWebEngine) cannot do here.
   cookies from a browser where you are signed in to YouTube and set
   `YT_DLP_COOKIES=/path/to/cookies.txt` in `.env` (passed to yt-dlp as
   `--cookies`). Keep that file private — it is a login credential.
+- **Buffering (VOD):** on-demand videos are NOT encoded in realtime —
+  ffmpeg runs as fast as the CPU allows, so the client banks a buffer
+  lead whenever the network/CPU permits (live streams stay paced via
+  `&live=1`). The client estimates the banked seconds from bytes
+  received vs decoded, holds a "Buffering…" gate until ~15 s is banked
+  (with fallbacks so a realtime-only pipeline never traps the viewer),
+  re-enters the buffering state when playback starves until ~8 s is
+  re-banked, sizes JSMpeg's decoder buffers at 8 MB video / 1 MB audio,
+  and auto-resumes at the current position (up to 3 attempts) when a
+  socket drops mid-video instead of reporting "Ended".
 - **VOD, not live-optimized:** this YouTube version resolves `bestvideo`
   for a video ID and transcodes as a forward stream. Seeking is
   *restart seeking*: both stream endpoints accept `?t=SECONDS`

@@ -70,8 +70,10 @@ main{padding:14px 18px 30px}
 /* ---- watch view ---- */
 #watchView{display:none;max-width:1180px;margin:0 auto}
 .backbtn{display:inline-flex;align-items:center;gap:8px;background:var(--chip);border-radius:999px;padding:11px 18px;font-size:15px;font-weight:500;min-height:44px;margin-bottom:14px}
-.canvaswrap{background:#000;border-radius:12px;overflow:hidden}
+.canvaswrap{background:#000;border-radius:12px;overflow:hidden;position:relative}
 #nc{width:100%;display:block;background:#000}
+#buffering{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);color:#fff;font-size:19px;font-weight:600;letter-spacing:.02em;z-index:3}
+#buffering[hidden]{display:none}
 .watchtitle{font-size:20px;font-weight:600;line-height:1.35;margin-top:14px}
 .watchchannel{color:var(--sub);font-size:14.5px;margin-top:5px}
 .seekrow{display:flex;align-items:center;gap:14px;margin-top:14px;background:var(--surface);border-radius:12px;padding:8px 14px}
@@ -135,7 +137,7 @@ main{padding:14px 18px 30px}
 <div id="watchView">
   <main>
     <button class="backbtn" id="btnBack">&#8592; Back</button>
-    <div class="canvaswrap"><canvas id="nc" width="854" height="480"></canvas></div>
+    <div class="canvaswrap"><canvas id="nc" width="854" height="480"></canvas><div id="buffering" hidden>Buffering&hellip;</div></div>
     <div class="watchtitle" id="npTitle">—</div>
     <div class="watchchannel" id="npChannel"></div>
     <div class="seekrow">
@@ -184,6 +186,13 @@ main{padding:14px 18px 30px}
   var playSeq = 0, durationSec = null, isLiveStream = false;
   var baseTimeSec = 0, streamStartedAtMs = null, scrubbing = false, seekInFlight = false;
   var lastItem = null, lastPosSec = 0; // remembered on Stop so Resume can restart there
+  // Buffer management: the server encodes VOD faster than realtime, so the
+  // client can bank a lead. We estimate the bank from bytes received on the
+  // player's socket minus media decoded, gate the start on a pre-roll
+  // target, and show a Buffering state instead of stuttering when it runs dry.
+  var watchdogTimer = null, bytesReceived = 0, byteSocket = null, framesDecoded = 0;
+  var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
+  var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false;
 
   var CHIPS = ['All', 'Music', 'Gaming', 'News', 'Live', 'Technology', 'Cars', 'Comedy', 'Sports', 'Science', 'Travel'];
   var AVATAR_COLORS = ['#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0', '#00838f', '#2e7d32', '#f9a825', '#ef6c00', '#4e342e', '#546e7a'];
@@ -363,20 +372,93 @@ main{padding:14px 18px 30px}
   }
   function seekBy(delta) { seekTo(currentPosition() + delta); }
 
+  // ---- buffer management ----
+  function setBufferingUI(show, label) {
+    var el = $('buffering');
+    if (label) el.textContent = label;
+    el.hidden = !show;
+  }
+  function decodedSeconds() {
+    if (player && typeof player.currentTime === 'number' && isFinite(player.currentTime) && player.currentTime > 0) return player.currentTime;
+    return framesDecoded / 30;
+  }
+  function bufferedSecondsEstimate() {
+    if (!bytesReceived) return 0;
+    var kbps = { '360': 700, '480': 1100, '720': 1800, '1080': 3500 }[$('quality').value] || 1100;
+    if ($('audioMode').value === 'combined') kbps += 128;
+    var bytesPerSec = kbps * 1000 / 8 * 1.06; // +MPEG-TS overhead
+    return Math.max(0, bytesReceived / bytesPerSec - decodedSeconds());
+  }
+  function attachByteCounter() {
+    if (!player || !player.source || !player.source.socket) return;
+    var sock = player.source.socket;
+    if (byteSocket === sock) return;
+    byteSocket = sock;
+    try {
+      sock.addEventListener('message', function (e) {
+        if (e && e.data) bytesReceived += (e.data.byteLength || e.data.size || 0);
+      });
+    } catch (err) {}
+  }
+  function stopWatchdog() { if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; } }
+  function startWatchdog(token) {
+    stopWatchdog();
+    lastCt = -1; lastAdvanceAt = performance.now(); playStartedAt = performance.now();
+    preRollDone = false; bufferingNow = true; streamEnded = false;
+    setBufferingUI(true, 'Buffering…');
+    watchdogTimer = setInterval(function () {
+      if (token !== playSeq || streamEnded) return;
+      attachByteCounter();
+      var now = performance.now();
+      var ct = decodedSeconds();
+      if (ct > lastCt + 0.05) { lastCt = ct; lastAdvanceAt = now; }
+      var banked = bufferedSecondsEstimate();
+      if (!preRollDone) {
+        // Start (well, reveal) playback only once a real lead is banked:
+        // ~15s for VOD, ~5s for live (which cannot run far ahead). If the
+        // encoder can only manage realtime, don't trap the viewer: a few
+        // seconds of smooth decode or a 30s wait also releases the gate.
+        var target = isLiveStream ? 5 : 15;
+        if (banked >= target || (ct > 1 && banked >= 3) || (player && now - playStartedAt > 30000)) {
+          preRollDone = true; bufferingNow = false; autoResumeAttempts = 0;
+          setBufferingUI(false);
+          if (!streamEnded) $('npState').textContent = 'Playing';
+        }
+        return;
+      }
+      if (!bufferingNow && now - lastAdvanceAt > 2500) {
+        bufferingNow = true;
+        setBufferingUI(true, 'Buffering…');
+        $('npState').textContent = 'Buffering…';
+      } else if (bufferingNow && (banked >= 8 || (now - lastAdvanceAt < 900 && banked >= 3))) {
+        bufferingNow = false;
+        setBufferingUI(false);
+        $('npState').textContent = 'Playing';
+      }
+    }, 500);
+  }
+
   // ===== MPEG1 playback (canvas + JSMpeg, separate MP3 audio pipe) =====
   function startVideo(token) {
     var quality = $('quality').value;
     var useCombined = $('audioMode').value === 'combined';
     var wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host +
       '/ws/mpeg1?v=' + encodeURIComponent(curId) + '&quality=' + encodeURIComponent(quality) +
-      '&t=' + encodeURIComponent(baseTimeSec) + '&mode=' + encodeURIComponent($('audioMode').value);
+      '&t=' + encodeURIComponent(baseTimeSec) + '&mode=' + encodeURIComponent($('audioMode').value) +
+      '&live=' + (isLiveStream ? '1' : '0');
     $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Starting video...';
     fpsCount = 0; lastFps = 0; $('npFps').textContent = '0 FPS';
+    framesDecoded = 0; bytesReceived = 0; byteSocket = null; streamEnded = false;
     player = new JSMpeg.Player(wsUrl, {
-      canvas: nc, audio: useCombined, streaming: true, maxBufferSize: 4 * 1024 * 1024,
+      canvas: nc, audio: useCombined, streaming: true,
+      // This JSMpeg build sizes its decoder buffers from these two options
+      // (its old maxBufferSize option is ignored): 8 MB of video buffer is
+      // what physically holds the banked buffer lead.
+      videoBufferSize: 8 * 1024 * 1024, audioBufferSize: 1024 * 1024,
       pauseWhenHidden: false, preserveDrawingBuffer: true,
       onVideoDecode: function () {
         if (!player || token !== playSeq) return;
+        framesDecoded++;
         if (streamStartedAtMs == null) {
           streamStartedAtMs = performance.now();
           seekInFlight = false;
@@ -393,12 +475,28 @@ main{padding:14px 18px 30px}
         if (now - lastFps >= 1000) {
           $('npFps').textContent = fpsCount + ' FPS';
           fpsCount = 0; lastFps = now;
-          $('npState').textContent = 'Playing';
+          if (!bufferingNow) $('npState').textContent = 'Playing';
         }
       },
       onSourceEstablished: function () { if (token === playSeq) $('npState').textContent = 'Connected'; },
+      onStalled: function () { /* the watchdog notices via currentTime */ },
       onSourceCompleted: function () {
         if (token !== playSeq) return;
+        streamEnded = true;
+        setBufferingUI(false);
+        // A socket that closes well before the end of the video is a
+        // dropped connection (proxy hiccup, network switch), not the end:
+        // restart the stream at the current position automatically.
+        var pos = currentPosition();
+        var endedNaturally = durationSec != null && pos >= durationSec - 3;
+        if (!endedNaturally && cur && autoResumeAttempts < 3) {
+          autoResumeAttempts++;
+          var it = cur, resumeAt = isLiveStream ? 0 : pos;
+          $('npState').textContent = 'Connection interrupted — resuming…';
+          setBufferingUI(true, 'Reconnecting…');
+          setTimeout(function () { if (token === playSeq) startPlayback(it, resumeAt); }, 1500);
+          return;
+        }
         $('npState').textContent = 'Ended';
         if (durationSec != null) { baseTimeSec = durationSec; streamStartedAtMs = null; }
         seekInFlight = false;
@@ -410,6 +508,8 @@ main{padding:14px 18px 30px}
   }
 
   function teardownStreams() {
+    stopWatchdog();
+    setBufferingUI(false);
     if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
     if (forceTimer) { clearTimeout(forceTimer); forceTimer = null; }
     if (player) { try { player.destroy(); } catch (e) {} player = null; }
@@ -421,7 +521,8 @@ main{padding:14px 18px 30px}
     teardownStreams();
     cur = it; curId = it.id;
     durationSec = (typeof it.duration === 'number' && it.duration > 0) ? it.duration : null;
-    isLiveStream = false;
+    isLiveStream = !!(it.isLive || it.live);
+    startWatchdog(token);
     baseTimeSec = Math.max(0, Number(startSec) || 0);
     if (durationSec != null) baseTimeSec = Math.min(baseTimeSec, Math.max(0, durationSec - 0.3));
     streamStartedAtMs = null;

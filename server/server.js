@@ -49,6 +49,24 @@ const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const YT_DLP = process.env.YT_DLP || 'yt-dlp';
 const YT_DLP_COOKIES = process.env.YT_DLP_COOKIES || '';
 
+// ffmpeg pacing capabilities, probed once at startup. -readrate arrived
+// in ffmpeg 5.1, but -readrate_initial_burst only in 6.1 — and the Docker
+// image (Debian bookworm) ships ffmpeg 5.1, where passing the 6.1 option
+// makes ffmpeg exit instantly ("Unrecognized option") and every VOD
+// stream hangs at Buffering forever. Never pass an option the installed
+// ffmpeg hasn't confirmed it supports. Defaults are the safe subset
+// (readrate without burst) until the probe answers.
+let FFMPEG_READRATE = true;
+let FFMPEG_READRATE_BURST = false;
+execFile('ffmpeg', ['-h', 'full'], { timeout: 10000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+  const help = String(stdout || '');
+  FFMPEG_READRATE = /-readrate[\s<]/.test(help);
+  FFMPEG_READRATE_BURST = help.includes('readrate_initial_burst');
+  console.log('ffmpeg pacing: ' + (FFMPEG_READRATE
+    ? 'readrate 2x' + (FFMPEG_READRATE_BURST ? ' + initial burst' : ' (no initial burst — ffmpeg < 6.1)')
+    : 'realtime (-re) — no -readrate support'));
+});
+
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const QUALITY = {
   '360': { scale: '640:360', canvas: [640, 360], bitrate: '700k' },
@@ -506,13 +524,17 @@ wss.on('connection', async (ws, req) => {
   // is what carries playback through network stalls. Live streams and
   // direct ?url= sources stay at 1x (-re): there is no "ahead" to run
   // to, and unpaced reads of a live edge just buffer-spin.
-  const pacedRealtime = !!direct || isLive;
-  const inputArgs = pacedRealtime
-    ? ['-re', '-reconnect', '1', '-reconnect_at_eof', '1',
-      '-reconnect_streamed', '1', '-reconnect_delay_max', '30']
-    : ['-readrate', '2', '-readrate_initial_burst', '10',
-      '-reconnect', '1', '-reconnect_at_eof', '1',
-      '-reconnect_streamed', '1', '-reconnect_delay_max', '30'];
+  const pacedRealtime = !!direct || isLive || process.env.FFMPEG_PACING === 'realtime';
+  const paceArgs = pacedRealtime
+    ? ['-re']
+    : (FFMPEG_READRATE
+      ? ['-readrate', '2', ...(FFMPEG_READRATE_BURST ? ['-readrate_initial_burst', '10'] : [])]
+      : ['-re']);
+  const inputArgs = [
+    ...paceArgs,
+    '-reconnect', '1', '-reconnect_at_eof', '1',
+    '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
+  ];
   let ffmpegArgs;
   if (combined && audioUrl) {
     // One ffmpeg, two inputs seeked to the same offset, one output stream:
@@ -576,11 +598,19 @@ wss.on('connection', async (ws, req) => {
       }, 100);
     }
   });
-  ffmpeg.stderr.on('data', () => {});
+  // Keep the tail of ffmpeg's stderr: if it exits instantly (bad option,
+  // dead input), the reason lands in the server log AND the client's
+  // status line instead of a silent "Stream ended".
+  let stderrTail = '';
+  ffmpeg.stderr.on('data', (d) => {
+    stderrTail = (stderrTail + d.toString()).slice(-600);
+  });
   ffmpeg.on('error', (e) => { sendJson({ type: 'error', message: e.message.slice(0, 120) }); });
   ffmpeg.on('close', (code) => {
     if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
-    sendJson({ type: 'status', message: 'Stream ended (code ' + code + ')' });
+    const tail = stderrTail.trim().split('\n').filter(Boolean).slice(-2).join(' | ').slice(0, 220);
+    if (code !== 0 && tail) console.error('ffmpeg exited (code ' + code + '): ' + tail);
+    sendJson({ type: 'status', message: 'Stream ended (code ' + code + ')' + (code !== 0 && tail ? ': ' + tail : '') });
     try { ws.close(); } catch (e) {}
   });
   const killFfmpeg = () => {

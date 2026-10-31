@@ -211,7 +211,7 @@ main{padding:14px 18px 30px}
   // target, and show a Buffering state instead of stuttering when it runs dry.
   var watchdogTimer = null, bytesReceived = 0, byteSocket = null, framesDecoded = 0;
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
-  var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false;
+  var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
 
   var CHIPS = ['All', 'Music', 'Gaming', 'News', 'Live', 'Technology', 'Cars', 'Comedy', 'Sports', 'Science', 'Travel'];
   var AVATAR_COLORS = ['#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0', '#00838f', '#2e7d32', '#f9a825', '#ef6c00', '#4e342e', '#546e7a'];
@@ -488,8 +488,11 @@ main{padding:14px 18px 30px}
         // the viewer: a few seconds of smooth decode or a 30s wait also
         // releases the gate.
         var target = isLiveStream ? 4 : 10;
+        if (player && bytesReceived === 0 && framesDecoded === 0 && now - playStartedAt > 20000) {
+          setBufferingUI(true, 'No data from server — check: docker logs tesla-drive');
+        }
         if (banked >= target || (ct > 1 && banked >= 3) || (player && now - playStartedAt > 30000)) {
-          preRollDone = true; bufferingNow = false; autoResumeAttempts = 0;
+          preRollDone = true; bufferingNow = false; autoResumeAttempts = 0; failedStarts = 0;
           setBufferingUI(false);
           if (!streamEnded) $('npState').textContent = 'Playing';
         }
@@ -553,6 +556,8 @@ main{padding:14px 18px 30px}
         if (token !== playSeq) return;
         streamEnded = true;
         setBufferingUI(false);
+        var failedStart = framesDecoded === 0;
+        if (failedStart) failedStarts++; else failedStarts = 0;
         // A socket that closes well before the end of the video is a
         // dropped connection (proxy hiccup, network switch), not the end:
         // restart the stream at the current position automatically.
@@ -561,12 +566,14 @@ main{padding:14px 18px 30px}
         if (!endedNaturally && cur && autoResumeAttempts < 3) {
           autoResumeAttempts++;
           var it = cur, resumeAt = isLiveStream ? 0 : pos;
-          $('npState').textContent = 'Connection interrupted — resuming…';
+          $('npState').textContent = failedStart ? 'Stream failed to start — retrying…' : 'Connection interrupted — resuming…';
           setBufferingUI(true, 'Reconnecting…');
           setTimeout(function () { if (token === playSeq) startPlayback(it, resumeAt); }, 1500);
           return;
         }
-        $('npState').textContent = 'Ended';
+        $('npState').textContent = failedStart
+          ? 'Failed to start — check the server (docker logs tesla-drive)'
+          : 'Ended';
         if (durationSec != null) { baseTimeSec = durationSec; streamStartedAtMs = null; }
         seekInFlight = false;
         lastItem = null; lastPosSec = 0;

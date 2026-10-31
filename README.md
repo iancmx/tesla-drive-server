@@ -243,11 +243,15 @@ QtWebEngine) cannot do here.
   `YT_DLP_COOKIES=/path/to/cookies.txt` in `.env` (passed to yt-dlp as
   `--cookies`). Keep that file private — it is a login credential.
 - **Buffering (VOD):** on-demand videos are encoded at a capped 2×
-  realtime (`-readrate 2`, first ~10 media-seconds burst immediately),
-  so the client steadily banks a buffer lead (live streams stay at 1×
-  via `&live=1`). The rate is capped on purpose: a fully unpaced encode
-  floods JSMpeg's realtime-oriented sync loop and the audio races ahead
-  of the picture. The client estimates the banked seconds from bytes
+  realtime (`-readrate 2`; on ffmpeg ≥ 6.1 the first ~10 media-seconds
+  also burst immediately), so the client steadily banks a buffer lead
+  (live streams stay at 1× via `&live=1`). The server probes the
+  installed ffmpeg's options at startup and only uses what exists —
+  `-readrate_initial_burst` needs ffmpeg 6.1 while the bookworm-based
+  Docker image ships 5.1, and passing it there once made every stream
+  hang at Buffering. The rate is capped on purpose: a fully unpaced
+  encode floods JSMpeg's realtime-oriented sync loop and the audio
+  races ahead of the picture. The client estimates the banked seconds from bytes
   received vs decoded, holds a "Buffering…" gate until ~10 s is banked
   (with fallbacks so a realtime-only pipeline never traps the viewer),
   re-enters the buffering state when playback starves until ~8 s is

@@ -69,6 +69,14 @@ main{padding:14px 18px 30px}
 
 /* ---- watch view ---- */
 #watchView{display:none;max-width:1180px;margin:0 auto}
+#channelView{display:none;max-width:1180px;margin:0 auto}
+.chanhead{display:flex;align-items:center;gap:14px;margin:4px 0 22px}
+.chanhead .avatar{width:52px;height:52px;font-size:22px}
+.chantitle{font-size:24px;font-weight:700;line-height:1.25}
+.cardsub.link,.avatar.link{cursor:pointer}
+.cardsub.link:hover{color:#fff;text-decoration:underline}
+.watchchannel.link{cursor:pointer}
+.watchchannel.link:hover{color:#fff;text-decoration:underline}
 .backbtn{display:inline-flex;align-items:center;gap:8px;background:var(--chip);border-radius:999px;padding:11px 18px;font-size:15px;font-weight:500;min-height:44px;margin-bottom:14px}
 .canvaswrap{background:#000;border-radius:12px;overflow:hidden;position:relative}
 #nc{width:100%;display:block;background:#000}
@@ -169,6 +177,17 @@ main{padding:14px 18px 30px}
   </main>
 </div>
 
+<div id="channelView">
+  <main>
+    <button class="backbtn" id="btnChannelBack">&#8592; Back</button>
+    <div class="chanhead">
+      <div class="avatar" id="channelAvatar">?</div>
+      <div class="chantitle" id="channelName">Channel</div>
+    </div>
+    <div class="grid" id="channelGrid"></div>
+  </main>
+</div>
+
 <audio id="na" style="display:none"></audio>
 
 <script src="jsmpeg.min.js"></script>
@@ -176,7 +195,7 @@ main{padding:14px 18px 30px}
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var nc = $('nc'), na = $('na');
-  var player = null, cur = null, curId = null;
+  var player = null, cur = null, curId = null, curChannelId = '', curChannelName = '';
   var fpsCount = 0, lastFps = 0, syncTimer = null, forceTimer = null;
   var homeScroll = 0, activeChip = 'All';
   // Restart-seeking state: the MPEG1 stream itself has no timeline, so the
@@ -223,8 +242,8 @@ main{padding:14px 18px 30px}
   }
 
   // ---- home grid ----
-  function renderSkeletons(n) {
-    var grid = $('grid'); grid.innerHTML = '';
+  function renderSkeletons(n, grid) {
+    grid = grid || $('grid'); grid.innerHTML = '';
     for (var i = 0; i < n; i++) {
       var d = document.createElement('div'); d.className = 'card skel';
       var tw = document.createElement('div'); tw.className = 'thumbwrap';
@@ -234,21 +253,22 @@ main{padding:14px 18px 30px}
       grid.appendChild(d);
     }
   }
-  function renderState(msg, isErr) {
-    var grid = $('grid'); grid.innerHTML = '';
+  function renderState(msg, isErr, grid) {
+    grid = grid || $('grid'); grid.innerHTML = '';
     var d = document.createElement('div');
     d.className = 'state' + (isErr ? ' err' : '');
     d.textContent = msg;
     grid.appendChild(d);
   }
-  function renderResults(items, label) {
-    var grid = $('grid'); grid.innerHTML = '';
+  function renderResults(items, label, grid) {
+    var home = !grid;
+    grid = grid || $('grid'); grid.innerHTML = '';
     if (!items || !items.length) {
-      setStatus(label + ': no results');
-      renderState('No videos found. Try a different search.', false);
+      if (home) setStatus(label + ': no results');
+      renderState('No videos found. Try a different search.', false, grid);
       return;
     }
-    setStatus(label + ': ' + items.length + ' videos');
+    if (home) setStatus(label + ': ' + items.length + ' videos');
     items.forEach(function (it) {
       if (!/^[A-Za-z0-9_-]{11}$/.test(it.id)) return;
       var card = document.createElement('div'); card.className = 'card';
@@ -267,6 +287,12 @@ main{padding:14px 18px 30px}
       var tx = document.createElement('div'); tx.className = 'cardtext';
       var tt = document.createElement('div'); tt.className = 'cardtitle'; tt.textContent = it.title || 'Untitled';
       var s1 = document.createElement('div'); s1.className = 'cardsub'; s1.textContent = it.channel || '';
+      if (it.channelId) {
+        var goChannel = function (ev) { ev.stopPropagation(); openChannel(it.channelId, it.channel, false); };
+        s1.className += ' link'; s1.title = 'More from ' + (it.channel || 'this channel');
+        s1.onclick = goChannel;
+        av.className += ' link'; av.onclick = goChannel;
+      }
       tx.appendChild(tt); tx.appendChild(s1);
       var views = fmtViews(it.viewCount);
       if (views) {
@@ -328,16 +354,57 @@ main{padding:14px 18px 30px}
   function showWatch() {
     if ($('homeView').style.display !== 'none') homeScroll = window.scrollY || 0;
     $('homeView').style.display = 'none';
+    $('channelView').style.display = 'none';
     $('watchView').style.display = 'block';
     window.scrollTo(0, 0);
   }
   function showHome() {
     stopPlayback();
     $('watchView').style.display = 'none';
+    $('channelView').style.display = 'none';
     $('homeView').style.display = 'block';
     var y = homeScroll;
     requestAnimationFrame(function () { window.scrollTo(0, y); });
   }
+
+  // ---- channel view ----
+  var channelReturn = 'home';
+  function openChannel(channelId, channelName, fromWatch) {
+    if (!channelId) return;
+    channelReturn = fromWatch ? 'watch' : 'home';
+    $('homeView').style.display = 'none';
+    $('watchView').style.display = 'none';
+    $('channelView').style.display = 'block';
+    $('channelName').textContent = channelName || 'Channel';
+    var av = $('channelAvatar');
+    av.style.background = avatarColor(channelName);
+    av.textContent = (String(channelName || '?').trim().charAt(0) || '?').toUpperCase();
+    window.scrollTo(0, 0);
+    loadChannel(channelId);
+  }
+  function loadChannel(channelId) {
+    var grid = $('channelGrid');
+    renderSkeletons(8, grid);
+    fetch('/api/channel?id=' + encodeURIComponent(channelId)).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) {
+        renderState('Could not load this channel: ' + (d.error || 'error') +
+          (d.attempts ? ' — ' + d.attempts.join('; ').slice(0, 200) : ''), true, grid);
+        return;
+      }
+      if (d.channel && d.channel.name) $('channelName').textContent = d.channel.name;
+      renderResults(d.results, 'Channel', grid);
+    }).catch(function (e) {
+      renderState('Could not load this channel: ' + e.message, true, grid);
+    });
+  }
+  $('btnChannelBack').onclick = function () {
+    $('channelView').style.display = 'none';
+    if (channelReturn === 'watch' && cur) {
+      $('watchView').style.display = 'block';
+    } else {
+      showHome();
+    }
+  };
 
   // ---- virtual timeline / restart seeking ----
   function currentPosition() {
@@ -532,7 +599,11 @@ main{padding:14px 18px 30px}
     var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720], '1080': [1920, 1080] }[quality] || [854, 480];
     nc.width = dims[0]; nc.height = dims[1];
     $('npTitle').textContent = it.title || it.id;
-    $('npChannel').textContent = it.channel || '';
+    curChannelId = it.channelId || ''; curChannelName = it.channel || '';
+    var npCh = $('npChannel');
+    npCh.textContent = it.channel || '';
+    npCh.className = 'watchchannel' + (curChannelId ? ' link' : '');
+    npCh.onclick = curChannelId ? function () { openChannel(curChannelId, curChannelName, true); } : null;
     $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Buffering audio...';
     $('npResume').disabled = true;
     updateSeekUI();
@@ -542,6 +613,12 @@ main{padding:14px 18px 30px}
       fetch('/api/info?v=' + encodeURIComponent(it.id)).then(function (r) { return r.json(); }).then(function (d) {
         if (token !== playSeq || !d || !d.ok) return;
         isLiveStream = !!d.isLive;
+        if (d.channelId && !curChannelId) {
+          curChannelId = d.channelId; curChannelName = d.channel || curChannelName;
+          var npCh2 = $('npChannel');
+          npCh2.className = 'watchchannel link';
+          npCh2.onclick = function () { openChannel(curChannelId, curChannelName, true); };
+        }
         if (!isLiveStream && typeof d.duration === 'number' && d.duration > 0) durationSec = d.duration;
         updateSeekUI();
       }).catch(function () {});

@@ -146,10 +146,35 @@ function mapFlatEntry(e) {
     id,
     title: String(e.title || 'Untitled'),
     channel: String(e.channel || e.uploader || e.channel_name || ''),
+    channelId: String(e.channel_id || e.uploader_id || ''),
     duration: (typeof e.duration === 'number' && isFinite(e.duration)) ? Math.round(e.duration) : null,
     viewCount: (typeof e.view_count === 'number') ? e.view_count
       : (typeof e.views === 'number' ? e.views : null),
   };
+}
+
+function mapPipedItem(it) {
+  const m = String(it.url || '').match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  if (!m) return null;
+  const cm = String(it.uploaderUrl || '').match(/\/channel\/([A-Za-z0-9_-]+)/);
+  return {
+    id: m[1], title: String(it.title || 'Untitled'),
+    channel: String(it.uploaderName || ''),
+    channelId: cm ? cm[1] : '',
+    duration: (typeof it.duration === 'number' && it.duration >= 0) ? it.duration : null,
+    viewCount: (typeof it.views === 'number') ? it.views : null,
+  };
+}
+
+function mapInvidiousItem(it) {
+  const r = {
+    id: it.videoId, title: String(it.title || 'Untitled'),
+    channel: String(it.author || ''),
+    channelId: String(it.authorId || ''),
+    duration: (typeof it.lengthSeconds === 'number') ? it.lengthSeconds : null,
+    viewCount: (typeof it.viewCount === 'number') ? it.viewCount : null,
+  };
+  return VIDEO_ID_RE.test(r.id) ? r : null;
 }
 
 // ==========================================================================
@@ -182,6 +207,7 @@ app.get('/api/info', async (req, res) => {
       id,
       title: info.title || '',
       channel: info.channel || info.uploader || '',
+      channelId: info.channel_id || '',
       duration: (typeof info.duration === 'number') ? Math.round(info.duration) : null,
       viewCount: (typeof info.view_count === 'number') ? info.view_count : null,
       isLive: !!info.is_live,
@@ -252,16 +278,7 @@ app.get('/api/trending', async (req, res) => {
   for (const base of PIPED_TRENDING) {
     try {
       const items = await fetchJson(base + '?region=' + region);
-      const results = (Array.isArray(items) ? items : []).map((it) => {
-        const m = String(it.url || '').match(/[?&]v=([A-Za-z0-9_-]{11})/);
-        if (!m) return null;
-        return {
-          id: m[1], title: String(it.title || 'Untitled'),
-          channel: String(it.uploaderName || ''),
-          duration: (typeof it.duration === 'number' && it.duration >= 0) ? it.duration : null,
-          viewCount: (typeof it.views === 'number') ? it.views : null,
-        };
-      }).filter(Boolean);
+      const results = (Array.isArray(items) ? items : []).map(mapPipedItem).filter(Boolean);
       if (results.length) return res.json({ ok: true, source: 'piped', region, results });
       attempts.push(base + ': empty');
     } catch (e) { attempts.push(base + ': ' + e.message); }
@@ -271,18 +288,65 @@ app.get('/api/trending', async (req, res) => {
   for (const base of INVIDIOUS_TRENDING) {
     try {
       const items = await fetchJson(base + '?region=' + region);
-      const results = (Array.isArray(items) ? items : []).map((it) => ({
-        id: it.videoId, title: String(it.title || 'Untitled'),
-        channel: String(it.author || ''),
-        duration: (typeof it.lengthSeconds === 'number') ? it.lengthSeconds : null,
-        viewCount: (typeof it.viewCount === 'number') ? it.viewCount : null,
-      })).filter((r) => VIDEO_ID_RE.test(r.id));
+      const results = (Array.isArray(items) ? items : []).map(mapInvidiousItem).filter(Boolean);
       if (results.length) return res.json({ ok: true, source: 'invidious', region, results });
       attempts.push(base + ': empty');
     } catch (e) { attempts.push(base + ': ' + e.message); }
   }
 
   res.status(502).json({ ok: false, error: 'trending-unavailable', attempts });
+});
+
+// ---- Channel (latest videos from one channel) -------------------------------
+const CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
+app.get('/api/channel', async (req, res) => {
+  const id = String(req.query.id || '');
+  if (!CHANNEL_ID_RE.test(id)) return res.status(400).json({ ok: false, error: 'Invalid channel id' });
+  const attempts = [];
+
+  // Path 1: yt-dlp on the channel's Videos tab (flat playlist, latest first).
+  try {
+    const out = await ytDlp(['--flat-playlist', '--playlist-end', '30', '--no-warnings', '-J',
+      ...cookieArgs(), 'https://www.youtube.com/channel/' + id + '/videos'], 45000);
+    const data = JSON.parse(out);
+    const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
+    if (results.length) {
+      return res.json({ ok: true, source: 'yt-dlp',
+        channel: { id, name: String(data.title || results[0].channel || '') }, results });
+    }
+    attempts.push('yt-dlp: empty');
+  } catch (e) { attempts.push('yt-dlp: ' + (e.type || 'failed')); }
+
+  // Path 2: public Piped instances' channel endpoint.
+  for (const base of PIPED_TRENDING) {
+    const api = base.replace(/\/trending$/, '');
+    try {
+      const d = await fetchJson(api + '/channel/' + id);
+      const results = (Array.isArray(d.relatedStreams) ? d.relatedStreams : [])
+        .map(mapPipedItem).filter(Boolean);
+      if (results.length) {
+        return res.json({ ok: true, source: 'piped',
+          channel: { id, name: String(d.name || results[0].channel || '') }, results });
+      }
+      attempts.push(api + ': empty');
+    } catch (e) { attempts.push(api + ': ' + e.message); }
+  }
+
+  // Path 3: public Invidious instances' channel-videos endpoint.
+  for (const base of INVIDIOUS_TRENDING) {
+    const api = base.replace(/\/trending$/, '');
+    try {
+      const items = await fetchJson(api + '/channels/' + id + '/videos');
+      const results = (Array.isArray(items) ? items : []).map(mapInvidiousItem).filter(Boolean);
+      if (results.length) {
+        return res.json({ ok: true, source: 'invidious',
+          channel: { id, name: results[0].channel || '' }, results });
+      }
+      attempts.push(api + ': empty');
+    } catch (e) { attempts.push(api + ': ' + e.message); }
+  }
+
+  res.status(502).json({ ok: false, error: 'channel-unavailable', attempts });
 });
 
 // ---- Audio (separate MP3 pipe, as in the original repo) --------------------

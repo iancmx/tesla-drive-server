@@ -86,9 +86,10 @@ plain LAN) covers the page, the APIs and the `wss://` upgrade at once.
 |--------|----------|-------------|
 | WS | `/ws/mpeg1?v=VIDEOID&quality=360\|480\|720\|1080` | MPEG1-TS video over WebSocket. Text frames are JSON `{type:"status"\|"error", ...}`. Also accepts `?url=<direct media URL>` (validated) for testing/other sources. |
 | GET | `/api/audio?v=VIDEOID` | MP3 audio stream (`audio/mpeg`) for the same video. Also accepts `?url=`. |
-| GET | `/api/search?q=QUERY` | JSON `{ok, results:[{id,title,channel,duration,viewCount}]}` (yt-dlp `ytsearch20:`) |
+| GET | `/api/search?q=QUERY` | JSON `{ok, results:[{id,title,channel,channelId,duration,viewCount}]}` (yt-dlp `ytsearch20:`) |
 | GET | `/api/trending?region=US` | Same JSON shape; yt-dlp trending feed first, Piped/Invidious fallback; the `source` field says which path answered |
-| GET | `/api/info?v=VIDEOID` | `{ok, title, channel, duration, viewCount, isLive}` |
+| GET | `/api/info?v=VIDEOID` | `{ok, title, channel, channelId, duration, viewCount, isLive}` |
+| GET | `/api/channel?id=UC…` | `{ok, channel:{id,name}, results:[…]}` — a channel's latest ~30 videos; yt-dlp channel Videos tab first, Piped/Invidious fallback. The client uses it for the channel page behind every channel name/avatar |
 | GET | `/` | Redirects to the YouTube client below |
 | GET | `/youtube-client/` | The YouTube-style front page (trending grid, search, category chips) + watch view with the canvas player |
 | GET | `/probe/` | Tesla browser capability probe (adapted from the original repo, MIT) |

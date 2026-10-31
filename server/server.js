@@ -495,19 +495,24 @@ wss.on('connection', async (ws, req) => {
       (combined ? 'combined A/V' : 'video only') + ') at ' + startSeconds + 's...',
   });
 
-  // Pacing: for on-demand YouTube videos, ffmpeg is deliberately NOT
-  // paced to realtime (no -re): it encodes as fast as the CPU allows, so
-  // during good network moments the client banks a buffer lead that
-  // carries playback through stalls. The backpressure below throttles
-  // the encoder once enough data is queued, so the burst is self-limiting.
-  // Live streams and direct ?url= sources stay paced — there is no
-  // "ahead" to run to, and unpaced reads of a live edge just buffer-spin.
+  // Pacing: on-demand videos are encoded at a CAPPED 2x realtime
+  // (-readrate), with the first ~10 media-seconds delivered immediately
+  // (-readrate_initial_burst) for a fast pre-roll. The cap matters: an
+  // earlier fully-unpaced build flooded JSMpeg, whose A/V sync loop is
+  // built around a realtime-fed stream — the car reported audio racing
+  // ahead of the picture and heavy video stutter as it dropped frames
+  // trying to chase the audio clock. 2x still banks ~1s of buffer lead
+  // per second of playback (until the buffers/backpressure fill), which
+  // is what carries playback through network stalls. Live streams and
+  // direct ?url= sources stay at 1x (-re): there is no "ahead" to run
+  // to, and unpaced reads of a live edge just buffer-spin.
   const pacedRealtime = !!direct || isLive;
-  const inputArgs = [
-    ...(pacedRealtime ? ['-re'] : []),
-    '-reconnect', '1', '-reconnect_at_eof', '1',
-    '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
-  ];
+  const inputArgs = pacedRealtime
+    ? ['-re', '-reconnect', '1', '-reconnect_at_eof', '1',
+      '-reconnect_streamed', '1', '-reconnect_delay_max', '30']
+    : ['-readrate', '2', '-readrate_initial_burst', '10',
+      '-reconnect', '1', '-reconnect_at_eof', '1',
+      '-reconnect_streamed', '1', '-reconnect_delay_max', '30'];
   let ffmpegArgs;
   if (combined && audioUrl) {
     // One ffmpeg, two inputs seeked to the same offset, one output stream:

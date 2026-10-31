@@ -482,10 +482,12 @@ main{padding:14px 18px 30px}
       var banked = bufferedSecondsEstimate();
       if (!preRollDone) {
         // Start (well, reveal) playback only once a real lead is banked:
-        // ~15s for VOD, ~5s for live (which cannot run far ahead). If the
-        // encoder can only manage realtime, don't trap the viewer: a few
-        // seconds of smooth decode or a 30s wait also releases the gate.
-        var target = isLiveStream ? 5 : 15;
+        // ~10s for VOD, ~4s for live (which cannot run far ahead). The
+        // server produces at 2x realtime, so the bank keeps growing while
+        // playing. If the encoder can only manage realtime, don't trap
+        // the viewer: a few seconds of smooth decode or a 30s wait also
+        // releases the gate.
+        var target = isLiveStream ? 4 : 10;
         if (banked >= target || (ct > 1 && banked >= 3) || (player && now - playStartedAt > 30000)) {
           preRollDone = true; bufferingNow = false; autoResumeAttempts = 0;
           setBufferingUI(false);

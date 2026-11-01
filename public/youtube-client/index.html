@@ -162,8 +162,8 @@ main{padding:14px 18px 30px}
       <input type="range" id="vol" min="0" max="100" value="100">
       <button class="btn" id="btnSync">Sync +2s</button>
       <select id="audioMode" aria-label="Audio mode">
-        <option value="combined" selected>Sync audio</option>
-        <option value="separate">Compat audio</option>
+        <option value="combined">Sync audio</option>
+        <option value="separate" selected>Compat audio</option>
       </select>
       <select id="qualityWatch" aria-label="Quality">
         <option value="360">360p</option>
@@ -498,11 +498,15 @@ main{padding:14px 18px 30px}
         }
         return;
       }
-      if (!bufferingNow && now - lastAdvanceAt > 2500) {
+      // Only call it buffering when the bank is actually running dry AND
+      // frames have stopped for a while. A brief decoder hiccup with
+      // seconds of media still banked heals on its own — flashing the
+      // overlay for it (the old 2.5s, bank-blind trigger) was just noise.
+      if (!bufferingNow && now - lastAdvanceAt > 4000 && banked < 2) {
         bufferingNow = true;
         setBufferingUI(true, 'Buffering…');
         $('npState').textContent = 'Buffering…';
-      } else if (bufferingNow && (banked >= 8 || (now - lastAdvanceAt < 900 && banked >= 3))) {
+      } else if (bufferingNow && (banked >= 6 || (now - lastAdvanceAt < 900 && banked >= 3))) {
         bufferingNow = false;
         setBufferingUI(false);
         $('npState').textContent = 'Playing';

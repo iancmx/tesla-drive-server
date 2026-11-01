@@ -28,6 +28,7 @@ const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { URL } = require('url');
+const dnsLookup = require('dns').promises.lookup;
 
 // ---- tiny .env loader (no extra dependency) -------------------------------
 (function loadEnv() {
@@ -45,6 +46,11 @@ const { URL } = require('url');
 
 const PORT = parseInt(process.env.PORT, 10) || 8742;
 const HOST = process.env.HOST || '127.0.0.1';
+// Every playback spawns a software MPEG1/MP3 transcode — the single most
+// expensive thing this server does. Without a cap, anyone who can reach
+// the public proxy can saturate the host CPU with parallel streams.
+const MAX_STREAMS = Math.max(1, parseInt(process.env.TESLA_MAX_STREAMS, 10) || 6);
+let activeStreams = 0;
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const YT_DLP = process.env.YT_DLP || 'yt-dlp';
 const YT_DLP_COOKIES = process.env.YT_DLP_COOKIES || '';
@@ -54,9 +60,10 @@ const YT_DLP_COOKIES = process.env.YT_DLP_COOKIES || '';
 // image (Debian bookworm) ships ffmpeg 5.1, where passing the 6.1 option
 // makes ffmpeg exit instantly ("Unrecognized option") and every VOD
 // stream hangs at Buffering forever. Never pass an option the installed
-// ffmpeg hasn't confirmed it supports. Defaults are the safe subset
-// (readrate without burst) until the probe answers.
-let FFMPEG_READRATE = true;
+// ffmpeg hasn't confirmed it supports. The default until the probe
+// answers is the safest subset (plain realtime): a stream opened in the
+// startup window must never be handed an option that may not exist.
+let FFMPEG_READRATE = false;
 let FFMPEG_READRATE_BURST = false;
 execFile('ffmpeg', ['-h', 'full'], { timeout: 10000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
   const help = String(stdout || '');
@@ -125,16 +132,61 @@ async function resolveStream(videoId, format) {
   return url;
 }
 
+// Is this IP literal in a range ffmpeg must never be sent to?
+function isBlockedIp(host) {
+  const v4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const a = +v4[1], b = +v4[2];
+    if (a === 0 || a === 10 || a === 127) return true;          // "this" net, private, loopback
+    if (a === 172 && b >= 16 && b <= 31) return true;           // private
+    if (a === 192 && b === 168) return true;                    // private
+    if (a === 169 && b === 254) return true;                    // link-local
+    if (a === 100 && b >= 64 && b <= 127) return true;          // CGNAT (incl. Tailscale)
+    if (a === 198 && (b === 18 || b === 19)) return true;       // benchmarking
+    if (a === 192 && b === 0) return true;                      // 192.0.0.0/24
+    if (a >= 240) return true;                                  // multicast / reserved / broadcast
+    return false;
+  }
+  if (host.includes(':')) {
+    const h = host.toLowerCase();
+    if (h === '::' || h === '::1') return true;
+    if (/^fe[89ab]/.test(h)) return true;                       // fe80::/10 link-local
+    if (h.startsWith('fc') || h.startsWith('fd')) return true;  // fc00::/7 ULA
+    // IPv4-mapped/compatible IPv6: Node's URL parser normalizes
+    // [::ffff:127.0.0.1] to ::ffff:7f00:1 (hex), so decode the last
+    // 32 bits back to a dotted quad and check that. (The dotted form
+    // is kept as a fallback for parsers that don't normalize.)
+    const hexMapped = h.match(/^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMapped) {
+      const hi = parseInt(hexMapped[1], 16), lo = parseInt(hexMapped[2], 16);
+      return isBlockedIp((hi >> 8) + '.' + (hi & 255) + '.' + (lo >> 8) + '.' + (lo & 255));
+    }
+    const mapped = h.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isBlockedIp(mapped[1]);
+  }
+  return false;
+}
+
 // Validate a direct-media ?url= parameter (used for testing / advanced use).
-function validateDirectUrl(raw) {
+async function validateDirectUrl(raw) {
   let u;
   try { u = new URL(raw); } catch (e) { return null; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-  const host = u.hostname.toLowerCase();
+  // Node keeps the brackets on IPv6 hostnames ('[::1]') — strip them, or
+  // every IPv6 range check below silently misses.
+  const host = u.hostname.toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
   if (host === 'localhost' || host.endsWith('.local')) return null;
-  if (/^127\./.test(host) || host === '::1') return null;
-  if (/^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return null;
-  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) return null;
+  if (isBlockedIp(host)) return null;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(host) && !host.includes(':')) {
+    // A public-looking name that resolves to a private address is the
+    // same SSRF with extra steps, so check every address it maps to.
+    // (Residual risk: HTTP redirects and DNS answers that change after
+    // this check — ffmpeg is pointed at the name, not a pinned address.)
+    try {
+      const addrs = await dnsLookup(host, { all: true });
+      if (!addrs.length || addrs.some((a) => isBlockedIp(a.address))) return null;
+    } catch (e) { return null; }
+  }
   return u.href;
 }
 
@@ -208,8 +260,18 @@ app.post('/api/probe-report', express.json({ limit: '1mb' }), (req, res) => {
   fs.mkdirSync(reportsDir, { recursive: true });
   const filename = path.join(reportsDir,
     'probe-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json');
-  fs.writeFile(filename, JSON.stringify(req.body || {}, null, 2), () => {});
-  res.json({ ok: true });
+  fs.writeFile(filename, JSON.stringify(req.body || {}, null, 2), (err) => {
+    if (err) return res.status(500).json({ ok: false, error: 'could-not-save' });
+    // Retention: keep only the newest 50 reports (ISO names sort by age),
+    // so this unauthenticated endpoint can't fill the disk.
+    try {
+      const files = fs.readdirSync(reportsDir).filter((f) => f.startsWith('probe-')).sort();
+      while (files.length > 50) {
+        try { fs.unlinkSync(path.join(reportsDir, files.shift())); } catch (e) {}
+      }
+    } catch (e) {}
+    res.json({ ok: true });
+  });
 });
 
 // ---- Info ------------------------------------------------------------------
@@ -369,6 +431,10 @@ app.get('/api/channel', async (req, res) => {
 
 // ---- Audio (separate MP3 pipe, as in the original repo) --------------------
 function streamMp3(req, res, inputUrl, startSeconds = 0) {
+  if (activeStreams >= MAX_STREAMS) {
+    return res.status(503).json({ ok: false, error: 'server-busy' });
+  }
+  activeStreams++;
   res.writeHead(200, {
     'Content-Type': 'audio/mpeg',
     'Cache-Control': 'no-cache, no-store',
@@ -376,7 +442,7 @@ function streamMp3(req, res, inputUrl, startSeconds = 0) {
   });
   const ffmpeg = spawn('ffmpeg', [
     ...seekArgs(startSeconds),
-    '-re', '-reconnect', '1', '-reconnect_at_eof', '1',
+    '-re', '-reconnect', '1',
     '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
     '-i', inputUrl, '-vn',
     '-fflags', 'nobuffer', '-flags', 'low_delay',
@@ -387,7 +453,7 @@ function streamMp3(req, res, inputUrl, startSeconds = 0) {
   ffmpeg.stdout.pipe(res);
   ffmpeg.stderr.on('data', () => {});
   ffmpeg.on('error', () => { try { res.end(); } catch (e) {} });
-  ffmpeg.on('close', () => { try { res.end(); } catch (e) {} });
+  ffmpeg.on('close', () => { activeStreams--; try { res.end(); } catch (e) {} });
   req.on('close', () => { try { ffmpeg.kill(); } catch (e) {} });
 }
 
@@ -395,7 +461,7 @@ app.get('/api/audio', async (req, res) => {
   const startSeconds = parseSeekOffset(req.query.t ?? req.query.start);
   if (startSeconds === null) return res.status(400).json({ ok: false, error: 'Invalid t (seek offset in seconds)' });
   if (req.query.url) {
-    const direct = validateDirectUrl(String(req.query.url));
+    const direct = await validateDirectUrl(String(req.query.url));
     if (!direct) return res.status(400).json({ ok: false, error: 'Invalid url' });
     return streamMp3(req, res, direct, startSeconds);
   }
@@ -403,6 +469,10 @@ app.get('/api/audio', async (req, res) => {
   if (!VIDEO_ID_RE.test(id)) return res.status(400).json({ ok: false, error: 'Invalid video id' });
   try {
     const audioUrl = await resolveStream(id, 'bestaudio[ext=m4a]/bestaudio/best');
+    // The resolve can take up to 30s; if the client gave up meanwhile,
+    // spawning ffmpeg now would leave it transcoding into a dead socket
+    // with no close event left to kill it.
+    if (res.destroyed) return;
     streamMp3(req, res, audioUrl, startSeconds);
   } catch (e) {
     res.status(502).json({ ok: false, error: e.type || 'resolve-failed', detail: e.stderr || '' });
@@ -427,6 +497,9 @@ if (TLS_CERT && TLS_KEY) {
   }, app);
   SCHEME = 'https';
 } else {
+  if (TLS_CERT || TLS_KEY) {
+    console.warn('TLS_CERT/TLS_KEY: only one is set — serving plain HTTP. Set BOTH to enable built-in HTTPS.');
+  }
   server = http.createServer(app);
 }
 const wss = new WebSocketServer({ noServer: true });
@@ -471,7 +544,7 @@ wss.on('connection', async (ws, req) => {
   const direct = params.get('url');
   const videoId = params.get('v');
   if (direct) {
-    inputUrl = validateDirectUrl(direct);
+    inputUrl = await validateDirectUrl(direct);
     if (!inputUrl) { sendJson({ type: 'error', message: 'Invalid ?url=' }); ws.close(); return; }
   } else if (videoId && VIDEO_ID_RE.test(videoId)) {
     sendJson({ type: 'status', message: 'Resolving YouTube video...' });
@@ -532,7 +605,7 @@ wss.on('connection', async (ws, req) => {
       : ['-re']);
   const inputArgs = [
     ...paceArgs,
-    '-reconnect', '1', '-reconnect_at_eof', '1',
+    '-reconnect', '1',
     '-reconnect_streamed', '1', '-reconnect_delay_max', '30',
   ];
   let ffmpegArgs;
@@ -546,7 +619,7 @@ wss.on('connection', async (ws, req) => {
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
       '-bf', '0', '-g', '30',
-      '-vf', 'fps=30,scale=' + q.scale,
+      '-vf', 'fps=30,scale=' + q.scale + ':force_original_aspect_ratio=decrease,pad=' + q.scale + ':(ow-iw)/2:(oh-ih)/2',
       '-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2',
       '-f', 'mpegts',
       '-muxdelay', '0.1', '-muxpreload', '0',
@@ -559,7 +632,7 @@ wss.on('connection', async (ws, req) => {
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
       '-bf', '0', '-g', '30',
-      '-vf', 'fps=30,scale=' + q.scale,
+      '-vf', 'fps=30,scale=' + q.scale + ':force_original_aspect_ratio=decrease,pad=' + q.scale + ':(ow-iw)/2:(oh-ih)/2',
       '-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2',
       '-f', 'mpegts',
       '-muxdelay', '0.1', '-muxpreload', '0',
@@ -570,12 +643,18 @@ wss.on('connection', async (ws, req) => {
       ...seekArgs(startSeconds), ...inputArgs, '-i', inputUrl, '-an',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
       '-bf', '0', '-g', '30',
-      '-vf', 'fps=30,scale=' + q.scale,
+      '-vf', 'fps=30,scale=' + q.scale + ':force_original_aspect_ratio=decrease,pad=' + q.scale + ':(ow-iw)/2:(oh-ih)/2',
       '-f', 'mpegts',
       '-muxdelay', '0.1', '-muxpreload', '0',
       '-',
     ];
   }
+  if (activeStreams >= MAX_STREAMS) {
+    sendJson({ type: 'error', message: 'Server busy: too many concurrent streams (max ' + MAX_STREAMS + ')' });
+    try { ws.close(); } catch (e) {}
+    return;
+  }
+  activeStreams++;
   const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   // Backpressure: if the client falls behind, PAUSE ffmpeg's output pipe
@@ -607,6 +686,7 @@ wss.on('connection', async (ws, req) => {
   });
   ffmpeg.on('error', (e) => { sendJson({ type: 'error', message: e.message.slice(0, 120) }); });
   ffmpeg.on('close', (code) => {
+    activeStreams--;
     if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
     const tail = stderrTail.trim().split('\n').filter(Boolean).slice(-2).join(' | ').slice(0, 220);
     if (code !== 0 && tail) console.error('ffmpeg exited (code ' + code + '): ' + tail);

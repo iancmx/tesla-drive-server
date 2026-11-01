@@ -214,6 +214,8 @@ main{padding:14px 18px 30px}
   var audioBaseSec = 0, initialAligned = false, audioHeldForBuffer = false;
   var bufferHoldSince = 0, lastKeeperAt = 0;
   var syncOffsetSec = 0, forceStarted = false, streamGen = 0, stablePlaySince = 0;
+  var keeperAudioHold = false, keeperVideoHold = false;
+  var lastByteSample = 0, lastByteSampleAt = 0, arrivalRate = 0, stallTimes = [];
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
 
@@ -464,12 +466,14 @@ main{padding:14px 18px 30px}
     if (player && typeof player.currentTime === 'number' && isFinite(player.currentTime) && player.currentTime > 0) return player.currentTime;
     return framesDecoded / 30;
   }
-  function bufferedSecondsEstimate() {
-    if (!bytesReceived) return 0;
+  function streamBytesPerSec() {
     var kbps = { '360': 700, '480': 1100, '720': 1800, '1080': 3500 }[$('quality').value] || 1100;
     if ($('audioMode').value === 'combined') kbps += 128;
-    var bytesPerSec = kbps * 1000 / 8 * 1.06; // +MPEG-TS overhead
-    return Math.max(0, bytesReceived / bytesPerSec - decodedSeconds());
+    return kbps * 1000 / 8 * 1.06; // +MPEG-TS overhead
+  }
+  function bufferedSecondsEstimate() {
+    if (!bytesReceived) return 0;
+    return Math.max(0, bytesReceived / streamBytesPerSec() - decodedSeconds());
   }
   function attachByteCounter() {
     if (!player || !player.source || !player.source.socket) return;
@@ -495,6 +499,31 @@ main{padding:14px 18px 30px}
       var ct = decodedSeconds();
       if (ct > lastCt + 0.05) { lastCt = ct; lastAdvanceAt = now; }
       var banked = bufferedSecondsEstimate();
+      // Delivery rate in media-seconds per wall-second, sampled over a
+      // ~2s window: 2.0 is a healthy 2x feed, 1.0 is barely realtime,
+      // below that the picture MUST starve no matter what the client
+      // does. Shown in the Buffering label so a starving stream says why.
+      if (lastByteSampleAt && now > lastByteSampleAt) {
+        var bpsNow = streamBytesPerSec();
+        if (bpsNow) arrivalRate = ((bytesReceived - lastByteSample) / bpsNow) / ((now - lastByteSampleAt) / 1000);
+        if (now - lastByteSampleAt >= 2000) { lastByteSample = bytesReceived; lastByteSampleAt = now; }
+      } else { lastByteSample = bytesReceived; lastByteSampleAt = now; }
+      if (bufferingNow) {
+        setBufferingUI(true, arrivalRate ? 'Buffering… receiving ~' + arrivalRate.toFixed(1) + '× speed' : 'Buffering…');
+      }
+      // Keeper-hold backstops: if a keeper resume was suppressed (a
+      // restart or hold intervened) and the pipe is STILL paused seconds
+      // later, nothing else will ever resume it — do it here.
+      if (keeperAudioHold && !audioHeldForBuffer && preRollDone && !bufferingNow &&
+          now - lastKeeperAt > 4000 && na.paused && na.currentTime > 0 && !na.ended &&
+          $('audioMode').value === 'separate') {
+        keeperAudioHold = false;
+        var bp = na.play(); if (bp && bp.catch) bp.catch(function () {});
+      }
+      if (keeperVideoHold && preRollDone && !bufferingNow && player && now - lastKeeperAt > 4000) {
+        keeperVideoHold = false;
+        try { player.play(); } catch (e) {}
+      }
       if (!preRollDone) {
         // Start (well, reveal) playback only once a real lead is banked:
         // ~10s for VOD, ~4s for live (which cannot run far ahead). The
@@ -512,8 +541,8 @@ main{padding:14px 18px 30px}
           if (framesDecoded > 0) failedStarts = 0;
           setBufferingUI(false);
           if (!streamEnded) $('npState').textContent = 'Playing';
-          if (!streamEnded && $('audioMode').value === 'separate' && audioHeldForBuffer) {
-            audioHeldForBuffer = false;
+          if (!streamEnded && $('audioMode').value === 'separate' && (audioHeldForBuffer || keeperAudioHold)) {
+            audioHeldForBuffer = false; keeperAudioHold = false;
             var rp = na.play(); if (rp && rp.catch) rp.catch(function () {});
           }
         }
@@ -526,7 +555,7 @@ main{padding:14px 18px 30px}
       // A wedged decoder never meets the exit conditions below (server
       // backpressure stops the bank growing too): restart outright after
       // ~12s without a single frame advance.
-      if (bufferingNow && now - lastAdvanceAt > 12000) {
+      if (bufferingNow && now - lastAdvanceAt > 20000 && banked < 2) {
         restartVideoAt($('audioMode').value === 'separate'
           ? audioBaseSec + (na.currentTime || 0) : currentPosition(), token);
         return;
@@ -536,6 +565,26 @@ main{padding:14px 18px 30px}
       // seconds of media still banked heals on its own — flashing the
       // overlay for it (the old 2.5s, bank-blind trigger) was just noise.
       if (!bufferingNow && now - lastAdvanceAt > 4000 && banked < 2) {
+        // Repeated starvation means this quality is not sustaining on
+        // this path (server CPU, network, or car decode): step down a
+        // level instead of flapping the overlay forever.
+        stallTimes.push(now);
+        stallTimes = stallTimes.filter(function (t) { return now - t < 90000; });
+        var qOrder = ['360', '480', '720', '1080'];
+        var qi2 = qOrder.indexOf($('quality').value);
+        if (stallTimes.length >= 3 && qi2 > 0 && !isLiveStream && cur) {
+          var nq2 = qOrder[qi2 - 1], oq2 = qOrder[qi2];
+          $('quality').value = nq2; $('qualityWatch').value = nq2;
+          stallTimes = [];
+          var itS = cur, posS = currentPosition();
+          startPlayback(itS, posS);
+          var tokS = playSeq; // the NEW stream's token, captured after the restart
+          setTimeout(function () {
+            if (tokS !== playSeq) return;
+            $('npState').textContent = 'Dropped to ' + nq2 + 'p — ' + oq2 + 'p kept starving';
+          }, 1600);
+          return;
+        }
         bufferingNow = true;
         setBufferingUI(true, 'Buffering…');
         $('npState').textContent = 'Buffering…';
@@ -555,8 +604,8 @@ main{padding:14px 18px 30px}
         bufferingNow = false; stablePlaySince = now;
         setBufferingUI(false);
         $('npState').textContent = 'Playing';
-        if (audioHeldForBuffer) {
-          audioHeldForBuffer = false;
+        if (audioHeldForBuffer || keeperAudioHold) {
+          audioHeldForBuffer = false; keeperAudioHold = false;
           var pp = na.play(); if (pp && pp.catch) pp.catch(function () {});
         }
       }
@@ -600,6 +649,8 @@ main{padding:14px 18px 30px}
     // clock until reset: without this, a restart inherits a lastCt from
     // minutes into the previous video and stall detection goes blind.
     streamGen++; lastCt = -1; lastAdvanceAt = performance.now();
+    keeperAudioHold = false; keeperVideoHold = false;
+    lastByteSample = 0; lastByteSampleAt = 0; arrivalRate = 0;
     var pl = new JSMpeg.Player(wsUrl, {
       canvas: nc, audio: useCombined, streaming: true,
       // This JSMpeg build sizes its decoder buffers from these two options
@@ -704,7 +755,7 @@ main{padding:14px 18px 30px}
     audioBaseSec = baseTimeSec; initialAligned = false;
     audioHeldForBuffer = false; lastKeeperAt = 0;
     syncOffsetSec = 0; forceStarted = false; stablePlaySince = 0;
-    if (!autoResume) autoResumeAttempts = 0;
+    if (!autoResume) { autoResumeAttempts = 0; stallTimes = []; }
     showWatch();
     var quality = $('quality').value;
     var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720], '1080': [1920, 1080] }[quality] || [854, 480];
@@ -791,18 +842,22 @@ main{padding:14px 18px 30px}
       if (Math.abs(drift) > 2.5) { restartVideoAt(audioPos, token); return; }
       if (drift > 0) {
         // Audio ahead: hold it briefly and let the picture catch up.
+        keeperAudioHold = true;
         try { na.pause(); } catch (e) {}
         setTimeout(function () {
           // A restart reuses this token but bumps streamGen; a buffering
           // hold owns the audio meanwhile. Either way, don't resume.
           if (token !== playSeq || gen !== streamGen || bufferingNow || audioHeldForBuffer) return;
+          keeperAudioHold = false;
           var p = na.play(); if (p && p.catch) p.catch(function () {});
         }, Math.max(100, (drift - 0.15) * 1000));
       } else if (typeof player.pause === 'function') {
         // Video ahead: freeze the picture briefly; audio keeps playing.
+        keeperVideoHold = true;
         try { player.pause(); } catch (e) {}
         setTimeout(function () {
           if (token !== playSeq || gen !== streamGen || bufferingNow || !player) return;
+          keeperVideoHold = false;
           try { player.play(); } catch (e) {}
         }, Math.max(100, (-drift - 0.15) * 1000));
       }

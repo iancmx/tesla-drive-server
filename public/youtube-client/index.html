@@ -497,6 +497,10 @@ main{padding:14px 18px 30px}
           preRollDone = true; bufferingNow = false; autoResumeAttempts = 0; failedStarts = 0;
           setBufferingUI(false);
           if (!streamEnded) $('npState').textContent = 'Playing';
+          if (!streamEnded && $('audioMode').value === 'separate' && audioHeldForBuffer) {
+            audioHeldForBuffer = false;
+            var rp = na.play(); if (rp && rp.catch) rp.catch(function () {});
+          }
         }
         return;
       }
@@ -515,14 +519,16 @@ main{padding:14px 18px 30px}
           audioHeldForBuffer = true; bufferHoldSince = now;
         }
       } else if (bufferingNow && (banked >= 6 || (now - lastAdvanceAt < 900 && banked >= 3))) {
+        var framesFlowing = now - lastAdvanceAt < 900;
+        if (audioHeldForBuffer && !framesFlowing && now - bufferHoldSince > 4000) {
+          restartVideoAt(audioBaseSec + (na.currentTime || 0), token);
+          return;
+        }
         bufferingNow = false;
         setBufferingUI(false);
         $('npState').textContent = 'Playing';
         if (audioHeldForBuffer) {
           audioHeldForBuffer = false;
-          // A long stall loses too much ground to just resume: restart the
-          // video stream exactly where the (frozen) audio is.
-          if (now - bufferHoldSince > 4000) restartVideoAt(audioBaseSec + (na.currentTime || 0), token);
           var pp = na.play(); if (pp && pp.catch) pp.catch(function () {});
         }
       }
@@ -533,6 +539,15 @@ main{padding:14px 18px 30px}
   // Restart ONLY the video stream at a position (Compat-mode sync
   // corrections): the audio pipe keeps its place untouched.
   function restartVideoAt(pos, token) {
+    if ($('audioMode').value === 'separate') {
+      if (!na.paused) {
+        try { na.pause(); } catch (e) {}
+        // Restart from where the audio actually froze, not the caller's
+        // slightly older measurement.
+        pos = audioBaseSec + (na.currentTime || 0);
+      }
+      audioHeldForBuffer = true; bufferHoldSince = performance.now();
+    }
     if (player) { try { player.destroy(); } catch (e) {} player = null; }
     baseTimeSec = Math.max(0, pos);
     streamStartedAtMs = null; seekInFlight = false;
@@ -609,6 +624,10 @@ main{padding:14px 18px 30px}
         if (!endedNaturally && cur && autoResumeAttempts < 3) {
           autoResumeAttempts++;
           var it = cur, resumeAt = isLiveStream ? 0 : pos;
+          if ($('audioMode').value === 'separate') {
+            try { na.pause(); } catch (e) {}
+            audioHeldForBuffer = true;
+          }
           $('npState').textContent = failedStart ? 'Stream failed to start — retrying…' : 'Connection interrupted — resuming…';
           setBufferingUI(true, 'Reconnecting…');
           setTimeout(function () { if (token === playSeq) startPlayback(it, resumeAt); }, 1500);

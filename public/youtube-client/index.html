@@ -198,13 +198,14 @@ main{padding:14px 18px 30px}
   var player = null, cur = null, curId = null, curChannelId = '', curChannelName = '';
   var fpsCount = 0, lastFps = 0, syncTimer = null, forceTimer = null;
   var homeScroll = 0, activeChip = 'All';
+  var gridSeq = 0; // sequencing for home/channel fetches: newest request wins
   // Restart-seeking state: the MPEG1 stream itself has no timeline, so the
   // client tracks a virtual one — baseTimeSec is where the current stream
   // started in the source video, streamStartedAtMs is when its first frame
   // was decoded. Seeking = restart both pipes at a new baseTimeSec.
   var playSeq = 0, durationSec = null, isLiveStream = false;
   var baseTimeSec = 0, streamStartedAtMs = null, scrubbing = false, seekInFlight = false;
-  var lastItem = null, lastPosSec = 0; // remembered on Stop so Resume can restart there
+  var lastItem = null, lastPosSec = 0, lastWasLive = false; // remembered on Stop so Resume can restart there
   // Buffer management: the server encodes VOD faster than realtime, so the
   // client can bank a lead. We estimate the bank from bytes received on the
   // player's socket minus media decoded, gate the start on a pre-roll
@@ -212,6 +213,7 @@ main{padding:14px 18px 30px}
   var watchdogTimer = null, bytesReceived = 0, byteSocket = null, framesDecoded = 0;
   var audioBaseSec = 0, initialAligned = false, audioHeldForBuffer = false;
   var bufferHoldSince = 0, lastKeeperAt = 0;
+  var syncOffsetSec = 0, forceStarted = false, streamGen = 0, stablePlaySince = 0;
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
 
@@ -309,9 +311,11 @@ main{padding:14px 18px 30px}
   }
 
   function getJson(url, label) {
+    var seq = ++gridSeq;
     setStatus(label + '...');
     renderSkeletons(8);
     fetch(url).then(function (r) { return r.json(); }).then(function (d) {
+      if (seq !== gridSeq) return; // a newer request superseded this one
       if (!d.ok) {
         setStatus(label + ' failed');
         renderState(label + ' failed: ' + (d.error || 'error') +
@@ -321,6 +325,7 @@ main{padding:14px 18px 30px}
       }
       renderResults(d.results, label + (d.source ? ' (' + d.source + ')' : ''));
     }).catch(function (e) {
+      if (seq !== gridSeq) return;
       setStatus(label + ' failed');
       renderState(label + ' failed: ' + e.message, true);
     });
@@ -385,9 +390,11 @@ main{padding:14px 18px 30px}
     loadChannel(channelId);
   }
   function loadChannel(channelId) {
+    var seq = ++gridSeq;
     var grid = $('channelGrid');
     renderSkeletons(8, grid);
     fetch('/api/channel?id=' + encodeURIComponent(channelId)).then(function (r) { return r.json(); }).then(function (d) {
+      if (seq !== gridSeq) return; // a newer request superseded this one
       if (!d.ok) {
         renderState('Could not load this channel: ' + (d.error || 'error') +
           (d.attempts ? ' — ' + d.attempts.join('; ').slice(0, 200) : ''), true, grid);
@@ -396,6 +403,7 @@ main{padding:14px 18px 30px}
       if (d.channel && d.channel.name) $('channelName').textContent = d.channel.name;
       renderResults(d.results, 'Channel', grid);
     }).catch(function (e) {
+      if (seq !== gridSeq) return;
       renderState('Could not load this channel: ' + e.message, true, grid);
     });
   }
@@ -412,7 +420,12 @@ main{padding:14px 18px 30px}
   function currentPosition() {
     if (!cur) return 0;
     var pos = baseTimeSec;
-    if (streamStartedAtMs != null) pos += (performance.now() - streamStartedAtMs) / 1000;
+    // Prefer the media actually decoded: the wall clock keeps running
+    // through decoder freezes and keeper holds, which used to make
+    // Resume/seek jump past unseen media and misclassify late socket
+    // drops as natural ends.
+    if (player) pos += decodedSeconds();
+    else if (streamStartedAtMs != null) pos += (performance.now() - streamStartedAtMs) / 1000;
     if (durationSec != null) pos = Math.min(pos, durationSec);
     return Math.max(0, pos);
   }
@@ -493,8 +506,10 @@ main{padding:14px 18px 30px}
         if (player && bytesReceived === 0 && framesDecoded === 0 && now - playStartedAt > 20000) {
           setBufferingUI(true, 'No data from server — check: docker logs tesla-drive');
         }
-        if (banked >= target || (ct > 1 && banked >= 3) || (player && now - playStartedAt > 30000)) {
-          preRollDone = true; bufferingNow = false; autoResumeAttempts = 0; failedStarts = 0;
+        var anyData = bytesReceived > 0 || framesDecoded > 0;
+        if (banked >= target || (ct > 1 && banked >= 3) || (player && anyData && now - playStartedAt > 30000)) {
+          preRollDone = true; bufferingNow = false; stablePlaySince = now;
+          if (framesDecoded > 0) failedStarts = 0;
           setBufferingUI(false);
           if (!streamEnded) $('npState').textContent = 'Playing';
           if (!streamEnded && $('audioMode').value === 'separate' && audioHeldForBuffer) {
@@ -502,6 +517,18 @@ main{padding:14px 18px 30px}
             var rp = na.play(); if (rp && rp.catch) rp.catch(function () {});
           }
         }
+        return;
+      }
+      if (seekInFlight && framesDecoded === 0 && now - playStartedAt > 20000) {
+        seekInFlight = false; updateSeekUI(); // the seek stream never decoded; don't latch the controls
+      }
+      if (autoResumeAttempts > 0 && stablePlaySince && now - stablePlaySince > 60000) autoResumeAttempts = 0;
+      // A wedged decoder never meets the exit conditions below (server
+      // backpressure stops the bank growing too): restart outright after
+      // ~12s without a single frame advance.
+      if (bufferingNow && now - lastAdvanceAt > 12000) {
+        restartVideoAt($('audioMode').value === 'separate'
+          ? audioBaseSec + (na.currentTime || 0) : currentPosition(), token);
         return;
       }
       // Only call it buffering when the bank is actually running dry AND
@@ -512,9 +539,10 @@ main{padding:14px 18px 30px}
         bufferingNow = true;
         setBufferingUI(true, 'Buffering…');
         $('npState').textContent = 'Buffering…';
+        stablePlaySince = 0;
         // Compat mode: freeze the audio pipe with the video, or the audio
         // plays on through the stall and the two are out of sync forever.
-        if ($('audioMode').value === 'separate' && player && !na.paused) {
+        if ($('audioMode').value === 'separate' && player && na.currentTime > 0 && !na.ended) {
           try { na.pause(); } catch (e) {}
           audioHeldForBuffer = true; bufferHoldSince = now;
         }
@@ -524,7 +552,7 @@ main{padding:14px 18px 30px}
           restartVideoAt(audioBaseSec + (na.currentTime || 0), token);
           return;
         }
-        bufferingNow = false;
+        bufferingNow = false; stablePlaySince = now;
         setBufferingUI(false);
         $('npState').textContent = 'Playing';
         if (audioHeldForBuffer) {
@@ -546,6 +574,7 @@ main{padding:14px 18px 30px}
         // slightly older measurement.
         pos = audioBaseSec + (na.currentTime || 0);
       }
+      pos = Math.max(0, pos - syncOffsetSec); // keep any manual Sync offset
       audioHeldForBuffer = true; bufferHoldSince = performance.now();
     }
     if (player) { try { player.destroy(); } catch (e) {} player = null; }
@@ -567,7 +596,11 @@ main{padding:14px 18px 30px}
     $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Starting video...';
     fpsCount = 0; lastFps = 0; $('npFps').textContent = '0 FPS';
     framesDecoded = 0; bytesReceived = 0; byteSocket = null; streamEnded = false;
-    player = new JSMpeg.Player(wsUrl, {
+    // The watchdog's frame-advance tracker belongs to the OLD stream's
+    // clock until reset: without this, a restart inherits a lastCt from
+    // minutes into the previous video and stall detection goes blind.
+    streamGen++; lastCt = -1; lastAdvanceAt = performance.now();
+    var pl = new JSMpeg.Player(wsUrl, {
       canvas: nc, audio: useCombined, streaming: true,
       // This JSMpeg build sizes its decoder buffers from these two options
       // (its old maxBufferSize option is ignored): 8 MB of video buffer is
@@ -575,7 +608,7 @@ main{padding:14px 18px 30px}
       videoBufferSize: 8 * 1024 * 1024, audioBufferSize: 1024 * 1024,
       pauseWhenHidden: false, preserveDrawingBuffer: true,
       onVideoDecode: function () {
-        if (!player || token !== playSeq) return;
+        if (player !== pl || token !== playSeq) return;
         framesDecoded++;
         if (streamStartedAtMs == null) {
           streamStartedAtMs = performance.now();
@@ -608,10 +641,10 @@ main{padding:14px 18px 30px}
           if (!bufferingNow) $('npState').textContent = 'Playing';
         }
       },
-      onSourceEstablished: function () { if (token === playSeq) $('npState').textContent = 'Connected'; },
+      onSourceEstablished: function () { if (token === playSeq && player === pl) { $('npState').textContent = 'Connected'; attachByteCounter(); } },
       onStalled: function () { /* the watchdog notices via currentTime */ },
       onSourceCompleted: function () {
-        if (token !== playSeq) return;
+        if (player !== pl || token !== playSeq) return;
         streamEnded = true;
         setBufferingUI(false);
         var failedStart = framesDecoded === 0;
@@ -630,9 +663,10 @@ main{padding:14px 18px 30px}
           }
           $('npState').textContent = failedStart ? 'Stream failed to start — retrying…' : 'Connection interrupted — resuming…';
           setBufferingUI(true, 'Reconnecting…');
-          setTimeout(function () { if (token === playSeq) startPlayback(it, resumeAt); }, 1500);
+          setTimeout(function () { if (token === playSeq) startPlayback(it, resumeAt, true); }, 1500);
           return;
         }
+        if ($('audioMode').value === 'separate') { try { na.pause(); } catch (e) {} audioHeldForBuffer = false; }
         $('npState').textContent = failedStart
           ? 'Failed to start — check the server (docker logs tesla-drive)'
           : 'Ended';
@@ -643,6 +677,7 @@ main{padding:14px 18px 30px}
         updateSeekUI();
       }
     });
+    player = pl;
   }
 
   function teardownStreams() {
@@ -654,7 +689,7 @@ main{padding:14px 18px 30px}
     try { na.pause(); na.removeAttribute('src'); na.load(); } catch (e) {}
   }
 
-  function startPlayback(it, startSec) {
+  function startPlayback(it, startSec, autoResume) {
     var token = ++playSeq;
     teardownStreams();
     cur = it; curId = it.id;
@@ -664,13 +699,16 @@ main{padding:14px 18px 30px}
     baseTimeSec = Math.max(0, Number(startSec) || 0);
     if (durationSec != null) baseTimeSec = Math.min(baseTimeSec, Math.max(0, durationSec - 0.3));
     streamStartedAtMs = null;
+    framesDecoded = 0; bytesReceived = 0; lastCt = -1; // no stale counters from a previous video
     seekInFlight = baseTimeSec > 0;
     audioBaseSec = baseTimeSec; initialAligned = false;
     audioHeldForBuffer = false; lastKeeperAt = 0;
+    syncOffsetSec = 0; forceStarted = false; stablePlaySince = 0;
+    if (!autoResume) autoResumeAttempts = 0;
     showWatch();
     var quality = $('quality').value;
     var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720], '1080': [1920, 1080] }[quality] || [854, 480];
-    nc.width = dims[0]; nc.height = dims[1];
+    if (nc.width !== dims[0] || nc.height !== dims[1]) { nc.width = dims[0]; nc.height = dims[1]; } // assigning canvas size clears it — skip when unchanged
     $('npTitle').textContent = it.title || it.id;
     curChannelId = it.channelId || ''; curChannelName = it.channel || '';
     var npCh = $('npChannel');
@@ -727,27 +765,44 @@ main{padding:14px 18px 30px}
         if (!na.paused && na.readyState >= 2 && na.currentTime > 0) startVideo(token);
         return;
       }
+      if (forceStarted && !streamEnded && !na.paused && na.currentTime > 0) {
+        // The video was force-started silently and the audio has only
+        // just arrived: restart the cheap audio pipe at the video's
+        // position instead of letting the keeper throw the picture
+        // back to ~0 to meet it.
+        forceStarted = false; initialAligned = true;
+        var vpos = baseTimeSec + decodedSeconds();
+        audioBaseSec = vpos;
+        na.src = '/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(vpos) + '&_=' + Date.now();
+        na.load();
+        var fp = na.play(); if (fp && fp.catch) fp.catch(function () {});
+        return;
+      }
       if (streamEnded || bufferingNow || !preRollDone || streamStartedAtMs == null) return;
       if (na.paused) return;
+      if (isLiveStream) return; // live has no fixed timeline to correct against
       var now = performance.now();
       if (now - lastKeeperAt < 5000) return;
       var audioPos = audioBaseSec + (na.currentTime || 0);
-      var drift = audioPos - (baseTimeSec + decodedSeconds()); // >0: audio ahead
+      var drift = (audioPos - syncOffsetSec) - (baseTimeSec + decodedSeconds()); // >0: audio ahead of target
       if (Math.abs(drift) <= 0.35) return;
       lastKeeperAt = now;
+      var gen = streamGen;
       if (Math.abs(drift) > 2.5) { restartVideoAt(audioPos, token); return; }
       if (drift > 0) {
         // Audio ahead: hold it briefly and let the picture catch up.
         try { na.pause(); } catch (e) {}
         setTimeout(function () {
-          if (token !== playSeq) return;
+          // A restart reuses this token but bumps streamGen; a buffering
+          // hold owns the audio meanwhile. Either way, don't resume.
+          if (token !== playSeq || gen !== streamGen || bufferingNow || audioHeldForBuffer) return;
           var p = na.play(); if (p && p.catch) p.catch(function () {});
         }, Math.max(100, (drift - 0.15) * 1000));
       } else if (typeof player.pause === 'function') {
         // Video ahead: freeze the picture briefly; audio keeps playing.
         try { player.pause(); } catch (e) {}
         setTimeout(function () {
-          if (token !== playSeq || !player) return;
+          if (token !== playSeq || gen !== streamGen || bufferingNow || !player) return;
           try { player.play(); } catch (e) {}
         }, Math.max(100, (-drift - 0.15) * 1000));
       }
@@ -757,6 +812,7 @@ main{padding:14px 18px 30px}
     forceTimer = setTimeout(function () {
       if (token === playSeq && !player && curId) {
         $('npState').textContent = 'Forced start (no audio yet)...';
+        forceStarted = true;
         startVideo(token);
       }
     }, 10000);
@@ -767,7 +823,7 @@ main{padding:14px 18px 30px}
   function stopPlayback() {
     // Remember where we were: with restart-based playback, "pause" can
     // only mean stop the pipes and restart them at the same position.
-    if (cur) { lastItem = cur; lastPosSec = currentPosition(); }
+    if (cur) { lastItem = cur; lastPosSec = currentPosition(); lastWasLive = isLiveStream; }
     playSeq++;
     teardownStreams();
     cur = null; curId = null;
@@ -780,7 +836,7 @@ main{padding:14px 18px 30px}
 
   function resumePlayback() {
     if (!lastItem) return;
-    var it = lastItem, pos = lastPosSec;
+    var it = lastItem, pos = lastWasLive ? 0 : lastPosSec;
     lastItem = null; lastPosSec = 0;
     startPlayback(it, pos);
   }
@@ -789,7 +845,21 @@ main{padding:14px 18px 30px}
   $('npResume').onclick = resumePlayback;
   $('btnBack').onclick = showHome;
   $('logoHome').onclick = function () { if ($('watchView').style.display === 'block') showHome(); };
-  $('btnSync').onclick = function () { try { na.currentTime = Math.min(na.currentTime + 2, na.duration || 999); } catch (e) {} };
+  $('btnSync').onclick = function () {
+    // The keeper maintains this offset as its target; without that, it
+    // treated the manual +2s as drift and silently undid it.
+    syncOffsetSec = Math.min(10, syncOffsetSec + 2);
+    try { na.currentTime = Math.min(na.currentTime + 2, na.duration || 999); } catch (e) {}
+  };
+  na.addEventListener('error', function () {
+    if (cur && $('audioMode').value === 'separate') $('npState').textContent = 'Audio failed to load — check the server (docker logs tesla-drive)';
+  });
+  na.addEventListener('ended', function () {
+    if (cur && !streamEnded && $('audioMode').value === 'separate' &&
+        durationSec != null && currentPosition() < durationSec - 5) {
+      $('npState').textContent = 'Audio ended early — it will not resync on its own';
+    }
+  });
   $('vol').oninput = function () {
     na.volume = this.value / 100;
     if (player && $('audioMode').value === 'combined') { try { player.volume = this.value / 100; } catch (e) {} }
@@ -823,7 +893,7 @@ main{padding:14px 18px 30px}
 
   $('btnSearch').onclick = function () { setActiveChip(''); doSearch($('q').value, 'Search'); };
   $('q').onkeydown = function (e) { if (e.key === 'Enter') $('btnSearch').click(); };
-  $('region').onchange = function () { if (activeChip === 'All') loadTrending(); };
+  $('region').onchange = function () { setActiveChip('All'); loadTrending(); };
 
   if (/QtCarBrowser|Tesla/i.test(navigator.userAgent)) setStatus('Tesla detected — loading trending...');
   loadTrending();

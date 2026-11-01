@@ -210,6 +210,8 @@ main{padding:14px 18px 30px}
   // player's socket minus media decoded, gate the start on a pre-roll
   // target, and show a Buffering state instead of stuttering when it runs dry.
   var watchdogTimer = null, bytesReceived = 0, byteSocket = null, framesDecoded = 0;
+  var audioBaseSec = 0, initialAligned = false, audioHeldForBuffer = false;
+  var bufferHoldSince = 0, lastKeeperAt = 0;
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
 
@@ -506,15 +508,40 @@ main{padding:14px 18px 30px}
         bufferingNow = true;
         setBufferingUI(true, 'Buffering…');
         $('npState').textContent = 'Buffering…';
+        // Compat mode: freeze the audio pipe with the video, or the audio
+        // plays on through the stall and the two are out of sync forever.
+        if ($('audioMode').value === 'separate' && player && !na.paused) {
+          try { na.pause(); } catch (e) {}
+          audioHeldForBuffer = true; bufferHoldSince = now;
+        }
       } else if (bufferingNow && (banked >= 6 || (now - lastAdvanceAt < 900 && banked >= 3))) {
         bufferingNow = false;
         setBufferingUI(false);
         $('npState').textContent = 'Playing';
+        if (audioHeldForBuffer) {
+          audioHeldForBuffer = false;
+          // A long stall loses too much ground to just resume: restart the
+          // video stream exactly where the (frozen) audio is.
+          if (now - bufferHoldSince > 4000) restartVideoAt(audioBaseSec + (na.currentTime || 0), token);
+          var pp = na.play(); if (pp && pp.catch) pp.catch(function () {});
+        }
       }
     }, 500);
   }
 
   // ===== MPEG1 playback (canvas + JSMpeg, separate MP3 audio pipe) =====
+  // Restart ONLY the video stream at a position (Compat-mode sync
+  // corrections): the audio pipe keeps its place untouched.
+  function restartVideoAt(pos, token) {
+    if (player) { try { player.destroy(); } catch (e) {} player = null; }
+    baseTimeSec = Math.max(0, pos);
+    streamStartedAtMs = null; seekInFlight = false;
+    framesDecoded = 0; bytesReceived = 0; byteSocket = null; streamEnded = false;
+    preRollDone = false; bufferingNow = true; playStartedAt = performance.now();
+    setBufferingUI(true, 'Buffering…');
+    startVideo(token);
+  }
+
   function startVideo(token) {
     var quality = $('quality').value;
     var useCombined = $('audioMode').value === 'combined';
@@ -539,6 +566,18 @@ main{padding:14px 18px 30px}
           streamStartedAtMs = performance.now();
           seekInFlight = false;
           updateSeekUI();
+          // Compat startup alignment: the audio pipe started playing while
+          // this video stream was still resolving/connecting, so it is
+          // ahead by that pipeline latency. Restart the video once, right
+          // at the audio's position, and the two start locked together.
+          if (!initialAligned && $('audioMode').value === 'separate') {
+            initialAligned = true;
+            var ap = audioBaseSec + (na.currentTime || 0);
+            if (!na.paused && ap > baseTimeSec + 0.75) {
+              var t2 = token;
+              setTimeout(function () { if (t2 === playSeq && cur) restartVideoAt(ap, t2); }, 50);
+            }
+          }
           // Combined mode: JSMpeg plays audio through WebAudio, which the
           // browser may start suspended — resume it inside playback.
           try {
@@ -607,6 +646,8 @@ main{padding:14px 18px 30px}
     if (durationSec != null) baseTimeSec = Math.min(baseTimeSec, Math.max(0, durationSec - 0.3));
     streamStartedAtMs = null;
     seekInFlight = baseTimeSec > 0;
+    audioBaseSec = baseTimeSec; initialAligned = false;
+    audioHeldForBuffer = false; lastKeeperAt = 0;
     showWatch();
     var quality = $('quality').value;
     var dims = { '360': [640, 360], '480': [854, 480], '720': [1280, 720], '1080': [1920, 1080] }[quality] || [854, 480];
@@ -655,20 +696,41 @@ main{padding:14px 18px 30px}
       if (p && p.catch) p.catch(function () { setTimeout(tp, 150); });
     })();
 
-    // Keep an eye on the ~5s audio buffer: nudge forward once playing, and
-    // launch the video stream as soon as audio is actually playing.
-    var nudged = false;
+    // Launch the video stream as soon as audio is actually playing, then
+    // keep the two pipes locked together. The old design aligned them
+    // once at startup (plus a +4s audio nudge) and never corrected again,
+    // so the video pipeline's startup latency — and every later stall —
+    // became a permanent offset. The keeper below measures both
+    // positions on one timeline and trims any drift it finds.
     syncTimer = setInterval(function () {
       if (token !== playSeq || !curId) return;
-      if (!na.paused && na.readyState >= 2) {
-        if (!nudged && na.currentTime < 3) {
-          try { na.currentTime = Math.min(na.currentTime + 4, (na.duration || 999)); } catch (e) {}
-          nudged = true;
-        }
+      if (!player) {
+        if (!na.paused && na.readyState >= 2 && na.currentTime > 0) startVideo(token);
+        return;
       }
-      if (!player && !na.paused && na.readyState >= 2 && na.currentTime > 0) {
-        clearInterval(syncTimer); syncTimer = null;
-        startVideo(token);
+      if (streamEnded || bufferingNow || !preRollDone || streamStartedAtMs == null) return;
+      if (na.paused) return;
+      var now = performance.now();
+      if (now - lastKeeperAt < 5000) return;
+      var audioPos = audioBaseSec + (na.currentTime || 0);
+      var drift = audioPos - (baseTimeSec + decodedSeconds()); // >0: audio ahead
+      if (Math.abs(drift) <= 0.35) return;
+      lastKeeperAt = now;
+      if (Math.abs(drift) > 2.5) { restartVideoAt(audioPos, token); return; }
+      if (drift > 0) {
+        // Audio ahead: hold it briefly and let the picture catch up.
+        try { na.pause(); } catch (e) {}
+        setTimeout(function () {
+          if (token !== playSeq) return;
+          var p = na.play(); if (p && p.catch) p.catch(function () {});
+        }, Math.max(100, (drift - 0.15) * 1000));
+      } else if (typeof player.pause === 'function') {
+        // Video ahead: freeze the picture briefly; audio keeps playing.
+        try { player.pause(); } catch (e) {}
+        setTimeout(function () {
+          if (token !== playSeq || !player) return;
+          try { player.play(); } catch (e) {}
+        }, Math.max(100, (-drift - 0.15) * 1000));
       }
     }, 250);
 

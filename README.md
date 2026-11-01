@@ -228,7 +228,14 @@ QtWebEngine) cannot do here.
 
 - **Audio sync:** the client defaults to *Compat audio* mode — the
   original two-pipe design (separate MP3 pipe into a native `<audio>`
-  element, ~5 s buffer delay, Sync +2s compensation). *Sync audio*
+  element). Two free-running pipes drift, so the client actively keeps
+  them locked: the video stream restarts once at the audio's position
+  as soon as its first frame lands (absorbing the video pipeline's
+  startup latency), a keeper then measures both positions every 250 ms
+  and trims drift beyond ~0.35 s (briefly holding whichever pipe is
+  ahead; a restart-resync beyond ~2.5 s), and during a video rebuffer
+  stall the audio is held too instead of playing on into a permanent
+  offset. The Sync +2s button remains as a manual nudge. *Sync audio*
   (combined) mode muxes MP2 audio into the same MPEG-TS as the video
   and JSMpeg decodes both from the same timestamps, which is exact by
   construction on desktop browsers — but in-car testing (Oct 2026)

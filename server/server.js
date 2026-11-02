@@ -51,6 +51,11 @@ const HOST = process.env.HOST || '127.0.0.1';
 // the public proxy can saturate the host CPU with parallel streams.
 const MAX_STREAMS = Math.max(1, parseInt(process.env.TESLA_MAX_STREAMS, 10) || 6);
 let activeStreams = 0;
+// Optional shared-secret access gate (see the gate section below). Set
+// TESLA_ACCESS_TOKEN to a long random string to require it on every
+// page, API call and stream; unset = no gate (trusted LAN use).
+const ACCESS_TOKEN = process.env.TESLA_ACCESS_TOKEN || '';
+const ACCESS_COOKIE = 'tesla_access';
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const YT_DLP = process.env.YT_DLP || 'yt-dlp';
 const YT_DLP_COOKIES = process.env.YT_DLP_COOKIES || '';
@@ -252,6 +257,79 @@ function mapInvidiousItem(it) {
 // ==========================================================================
 const app = express();
 app.disable('x-powered-by');
+
+// ---- Access gate -----------------------------------------------------------
+// When TESLA_ACCESS_TOKEN is set, everything behind this server needs
+// the token. Three ways in, checked in this order per request: the
+// ?token= query param (the client attaches it from localStorage), the
+// x-access-token header, or the tesla_access cookie. The cookie is
+// planted by opening any page once with ?key=<token> — the response
+// sets the cookie and redirects to the clean URL, so the key never
+// lingers in the address bar. Unauthenticated page loads get a small
+// locked page with a key form; API calls get a 401 JSON.
+function tokenEquals(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+function requestToken(req) {
+  try {
+    const u = new URL(req.url, 'http://localhost');
+    const q = u.searchParams.get('token') || u.searchParams.get('key');
+    if (q) return q;
+  } catch (e) {}
+  if (req.headers['x-access-token']) return req.headers['x-access-token'];
+  const raw = req.headers.cookie || '';
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0 && part.slice(0, idx).trim() === ACCESS_COOKIE) {
+      try { return decodeURIComponent(part.slice(idx + 1).trim()); } catch (e) { return ''; }
+    }
+  }
+  return '';
+}
+function isAuthed(req) {
+  if (!ACCESS_TOKEN) return true;
+  return tokenEquals(requestToken(req), ACCESS_TOKEN);
+}
+const LOCKED_PAGE = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+  '<title>Locked — Tesla YouTube Drive</title><style>' +
+  'body{background:#0b0b0f;color:#eee;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}' +
+  '.box{text-align:center;padding:24px;max-width:420px}h1{font-size:22px}p{color:#999;font-size:15px}' +
+  'input{font-size:18px;padding:14px;border-radius:10px;border:1px solid #333;background:#17171d;color:#eee;width:100%;box-sizing:border-box;margin:14px 0}' +
+  'button{font-size:18px;padding:14px 28px;border-radius:10px;border:0;background:#e50914;color:#fff;width:100%;cursor:pointer}' +
+  '</style></head><body><div class="box"><h1>🔒 Tesla YouTube Drive</h1>' +
+  '<p>This server is access-gated. Enter the access key once — this browser will remember it.</p>' +
+  '<form method="GET" action="/"><input name="key" type="password" placeholder="Access key" autocomplete="off" autofocus>' +
+  '<button type="submit">Unlock</button></form></div></body></html>';
+
+// Liveness probe for the Docker healthcheck — deliberately outside the
+// gate so an enabled gate doesn't read as a dead container.
+app.get('/healthz', (req, res) => { res.json({ ok: true }); });
+
+if (ACCESS_TOKEN) {
+  app.use((req, res, next) => {
+    let u;
+    try { u = new URL(req.url, 'http://localhost'); } catch (e) { return next(); }
+    const keyParam = u.searchParams.get('key');
+    if (keyParam && tokenEquals(keyParam, ACCESS_TOKEN)) {
+      const secure = !!(req.socket && req.socket.encrypted) || req.headers['x-forwarded-proto'] === 'https';
+      res.setHeader('Set-Cookie', ACCESS_COOKIE + '=' + encodeURIComponent(ACCESS_TOKEN) +
+        '; Path=/; Max-Age=' + (60 * 60 * 24 * 400) + '; SameSite=Lax; HttpOnly' + (secure ? '; Secure' : ''));
+      u.searchParams.delete('key');
+      const qs = u.searchParams.toString();
+      return res.redirect(302, u.pathname + (qs ? '?' + qs : ''));
+    }
+    if (isAuthed(req)) return next();
+    if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) {
+      return res.status(401).send(LOCKED_PAGE);
+    }
+    return res.status(401).json({ ok: false, error: 'Unauthorized: access token required' });
+  });
+}
+
 app.use(express.static(PUBLIC_DIR));
 
 // ---- Probe report receiver (as in the original repo) ----------------------
@@ -508,6 +586,11 @@ server.on('upgrade', (req, socket, head) => {
   let pathname = '';
   try { pathname = new URL(req.url, 'http://localhost').pathname; } catch (e) {}
   if (pathname === '/ws/mpeg1') {
+    if (!isAuthed(req)) {
+      try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch (e) {}
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   } else {
     socket.destroy();
@@ -778,5 +861,6 @@ server.listen(PORT, HOST, () => {
   console.log('Tesla YouTube Drive running on ' + SCHEME + '://' + HOST + ':' + PORT);
   console.log('  Client : ' + SCHEME + '://' + HOST + ':' + PORT + '/youtube-client/');
   console.log('  Probe  : ' + SCHEME + '://' + HOST + ':' + PORT + '/probe/');
+  console.log('  Gate   : ' + (ACCESS_TOKEN ? 'ENABLED (TESLA_ACCESS_TOKEN set)' : 'off (set TESLA_ACCESS_TOKEN to enable)'));
   console.log('  yt-dlp : ' + YT_DLP + (YT_DLP_COOKIES ? ' (cookies file configured)' : ''));
 });

@@ -311,11 +311,32 @@ main{padding:14px 18px 30px}
     });
   }
 
+  // Access gate: a ?key= in the URL (or a token saved earlier) is
+  // kept in localStorage and attached to every API/stream request.
+  // The server ALSO plants an HttpOnly cookie when the key link is
+  // opened, so the two mechanisms back each other up — if either
+  // survives in the car browser, the gate stays transparent.
+  var accessKey = '';
+  try {
+    var urlKey = new URLSearchParams(window.location.search).get('key');
+    if (urlKey) {
+      accessKey = urlKey;
+      localStorage.setItem('teslaAccessKey', urlKey);
+      history.replaceState(null, '', window.location.pathname + window.location.hash);
+    } else {
+      accessKey = localStorage.getItem('teslaAccessKey') || '';
+    }
+  } catch (e) {}
+  function withKey(url) {
+    if (!accessKey) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(accessKey);
+  }
+
   function getJson(url, label) {
     var seq = ++gridSeq;
     setStatus(label + '...');
     renderSkeletons(8);
-    fetch(url).then(function (r) { return r.json(); }).then(function (d) {
+    fetch(withKey(url)).then(function (r) { return r.json(); }).then(function (d) {
       if (seq !== gridSeq) return; // a newer request superseded this one
       if (!d.ok) {
         setStatus(label + ' failed');
@@ -394,7 +415,7 @@ main{padding:14px 18px 30px}
     var seq = ++gridSeq;
     var grid = $('channelGrid');
     renderSkeletons(8, grid);
-    fetch('/api/channel?id=' + encodeURIComponent(channelId)).then(function (r) { return r.json(); }).then(function (d) {
+    fetch(withKey('/api/channel?id=' + encodeURIComponent(channelId))).then(function (r) { return r.json(); }).then(function (d) {
       if (seq !== gridSeq) return; // a newer request superseded this one
       if (!d.ok) {
         renderState('Could not load this channel: ' + (d.error || 'error') +
@@ -747,6 +768,7 @@ main{padding:14px 18px 30px}
       '/ws/mpeg1?v=' + encodeURIComponent(curId) + '&quality=' + encodeURIComponent(quality) +
       '&t=' + encodeURIComponent(baseTimeSec) + '&mode=' + encodeURIComponent($('audioMode').value) +
       '&live=' + (isLiveStream ? '1' : '0');
+    wsUrl = withKey(wsUrl);
     $('npState').textContent = baseTimeSec > 0 ? 'Seeking to ' + fmtDur(baseTimeSec) + '...' : 'Starting video...';
     fpsCount = 0; lastFps = 0; $('npFps').textContent = '0 FPS';
     framesDecoded = 0; bytesReceived = 0; byteSocket = null; streamEnded = false;
@@ -886,7 +908,7 @@ main{padding:14px 18px 30px}
 
     // If the grid item had no duration, fetch it so seeking can unlock.
     if (durationSec == null) {
-      fetch('/api/info?v=' + encodeURIComponent(it.id)).then(function (r) { return r.json(); }).then(function (d) {
+      fetch(withKey('/api/info?v=' + encodeURIComponent(it.id))).then(function (r) { return r.json(); }).then(function (d) {
         if (token !== playSeq || !d || !d.ok) return;
         isLiveStream = !!d.isLive;
         if (d.channelId && !curChannelId) {
@@ -911,7 +933,7 @@ main{padding:14px 18px 30px}
     // baseTimeSec); video waits for it, like the original client.
     try { na.playbackRate = 1; } catch (e) {}
     na.preload = 'none';
-    na.src = '/api/audio?v=' + encodeURIComponent(it.id) + '&t=' + encodeURIComponent(baseTimeSec) + '&_=' + Date.now();
+    na.src = withKey('/api/audio?v=' + encodeURIComponent(it.id) + '&t=' + encodeURIComponent(baseTimeSec) + '&_=' + Date.now());
     na.load();
     (function tp() {
       if (token !== playSeq || !curId) return;
@@ -939,7 +961,7 @@ main{padding:14px 18px 30px}
         forceStarted = false; initialAligned = true;
         var vpos = baseTimeSec + decodedSeconds();
         audioBaseSec = vpos;
-        na.src = '/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(vpos) + '&_=' + Date.now();
+        na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(vpos) + '&_=' + Date.now());
         na.load();
         var fp = na.play(); if (fp && fp.catch) fp.catch(function () {});
         return;

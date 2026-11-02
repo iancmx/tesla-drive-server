@@ -20,6 +20,10 @@ services:
       # above is what exposes it on your LAN. (Bare-metal default in the
       # code is 127.0.0.1.)
       HOST: "0.0.0.0"
+      # Optional access gate: uncomment and set a long random token —
+      # the whole site then requires it (open the site once with
+      # ?key=<token> in the car browser; it remembers it from then on).
+      # TESLA_ACCESS_TOKEN: "change-me-to-a-long-random-string"
       # Optional: Netscape-format cookies file for yt-dlp, used when
       # YouTube bot-blocks your IP ("Sign in to confirm you're not a
       # bot"). Put the file at ./config/cookies.txt on the host (see

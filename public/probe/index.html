@@ -221,7 +221,8 @@ if (isTesla && navigator.sendBeacon) {
         screen: screen.width + 'x' + screen.height,
         ts: new Date().toISOString()
       });
-      navigator.sendBeacon('/api/probe-report', data);
+      var _k = ''; try { _k = localStorage.getItem('teslaAccessKey') || ''; } catch (e) {}
+      navigator.sendBeacon('/api/probe-report' + (_k ? '?token=' + encodeURIComponent(_k) : ''), data);
     } catch (e) {}
   }, 3000);
 }

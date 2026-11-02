@@ -304,6 +304,22 @@ copied; it uses shell-string `exec` in places — this one does not):
   make it fetch and transcode video — do not expose it unauthenticated to
   the open internet without understanding that.
 
+### Access gate (optional, recommended when publicly hosted)
+
+Set the `TESLA_ACCESS_TOKEN` environment variable to a long random
+string and the server requires it on every page, API call and stream:
+
+- Open the site **once** with `?key=<token>` (e.g.
+  `https://your-host/?key=<token>`). The server plants a long-lived
+  `tesla_access` cookie and redirects to the clean URL; the client
+  also saves the token in localStorage and attaches it to its
+  requests, so the two mechanisms back each other up.
+- After that, bookmark and use the site normally — the gate is
+  invisible. Unauthenticated visitors get a small locked page.
+- Rotate by changing the variable, restarting, and opening the new
+  key link once. Leave the variable unset to disable the gate.
+  `GET /healthz` stays outside the gate for the Docker healthcheck.
+
 ## Pushing this local repo to GitHub
 
 This repo is a plain local git repository (no remote configured). To

@@ -498,6 +498,14 @@ main{padding:14px 18px 30px}
       var ct = decodedSeconds();
       if (ct > lastCt + 0.05) { lastCt = ct; lastAdvanceAt = now; }
       var banked = bufferedSecondsEstimate();
+      // With the metering source, "banked" (arrived minus decoded)
+      // includes the deliberate client-side stage, so it can't signal
+      // starvation. The stage depth itself is the honest gauge: the
+      // decoder starves only when the stage is (nearly) empty.
+      var starved = banked < 2;
+      if (player && player.source && typeof player.source.queuedBytes === 'number') {
+        starved = player.source.queuedBytes < streamBytesPerSec() * 0.5;
+      }
       // Delivery rate in media-seconds per wall-second, sampled over
       // a ~2s window: ~1.0 is a healthy metered feed, materially below
       // that the picture MUST starve no matter what the client does.
@@ -539,7 +547,7 @@ main{padding:14px 18px 30px}
       // A wedged decoder never meets the exit conditions below (server
       // backpressure stops the bank growing too): restart outright after
       // ~12s without a single frame advance.
-      if (bufferingNow && now - lastAdvanceAt > 20000 && banked < 2) {
+      if (bufferingNow && now - lastAdvanceAt > 20000) {
         restartVideoAt($('audioMode').value === 'separate'
           ? audioBaseSec + (na.currentTime || 0) : currentPosition(), token);
         return;
@@ -548,7 +556,7 @@ main{padding:14px 18px 30px}
       // frames have stopped for a while. A brief decoder hiccup with
       // seconds of media still banked heals on its own — flashing the
       // overlay for it (the old 2.5s, bank-blind trigger) was just noise.
-      if (!bufferingNow && now - lastAdvanceAt > 4000 && banked < 2) {
+      if (!bufferingNow && now - lastAdvanceAt > 3000 && starved) {
         // Repeated starvation means this quality is not sustaining on
         // this path (server CPU, network, or car decode): step down a
         // level instead of flapping the overlay forever.
@@ -619,6 +627,119 @@ main{padding:14px 18px 30px}
     startVideo(token);
   }
 
+  // ==== MeteredSource ====
+  // A JSMpeg source that owns the WebSocket itself, STAGES a few
+  // seconds of stream, then meters it into the decoder at exactly
+  // realtime. Necessary because this player renders every picture the
+  // instant it decodes: media arriving in clumps (proxy buffering,
+  // cellular delivery, server catch-up) is otherwise played as
+  // fast-forward bursts between freezes, no matter how carefully the
+  // far end paces — the clumping happens downstream of the server.
+  // The stage absorbs the clumps; the meter guarantees a 1.0x feed.
+  // Implements the bundle's source contract (connect/start/destroy,
+  // established/progress, onSourceEstablished/onSourceCompleted via
+  // options) and exposes .socket so the byte counter keeps working.
+  function MeteredSource(url, options) {
+    this.url = url;
+    this.options = options || {};
+    this.streaming = true;
+    this.progress = 0;
+    this.established = false;
+    this.onEstablishedCallback = this.options.onSourceEstablished;
+    this.onCompletedCallback = this.options.onSourceCompleted;
+    this.hookOnEstablished = this.options.hookOnEstablished;
+    this.destination = null;
+    this.socket = null;
+    this.dead = false;
+    this.notified = false;
+    this.queue = [];
+    this.queuedBytes = 0;
+    this.headOffset = 0;
+    this.feeding = false;
+    this.feedTimer = null;
+    this.lastFeedAt = 0;
+    var bps = this.options.meterBytesPerSec || 150000;
+    this.meterBps = bps;
+    this.stageBytes = bps * (this.options.meterStageSec || 4);
+    this.feedBps = bps * 1.03;
+  }
+  MeteredSource.prototype.connect = function (destination) {
+    this.destination = destination;
+    this._open();
+  };
+  MeteredSource.prototype.start = function () { this._open(); };
+  MeteredSource.prototype._open = function () {
+    if (this.socket || this.dead) return;
+    var self = this;
+    var ws;
+    try { ws = new WebSocket(this.url); } catch (e) { return; }
+    ws.binaryType = 'arraybuffer';
+    this.socket = ws;
+    ws.onopen = function () { self.progress = 1; };
+    ws.onmessage = function (ev) {
+      if (self.dead) return;
+      var first = !self.established;
+      self.established = true;
+      if (first) {
+        if (self.hookOnEstablished) self.hookOnEstablished();
+        if (self.onEstablishedCallback) self.onEstablishedCallback(self);
+      }
+      if (typeof ev.data === 'string') return; // status JSON: not media; the demuxer only resyncs over it
+      var u8 = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
+      self.queue.push(u8);
+      self.queuedBytes += u8.byteLength;
+      if (self.queuedBytes > self.meterBps * 45) { self._fail(); return; }
+      self._maybeFeed();
+    };
+    ws.onclose = function () { self._notifyComplete(); self._cleanup(); };
+    ws.onerror = function () { /* onclose follows */ };
+  };
+  MeteredSource.prototype._maybeFeed = function () {
+    if (this.feeding || this.dead) return;
+    if (this.queuedBytes < this.stageBytes) return;
+    this.feeding = true;
+    this.lastFeedAt = performance.now();
+    var self = this;
+    this.feedTimer = setInterval(function () { self._drain(); }, 50);
+  };
+  MeteredSource.prototype._drain = function () {
+    if (this.dead || !this.destination) return;
+    var now = performance.now();
+    var budget = this.feedBps * (now - this.lastFeedAt) / 1000;
+    this.lastFeedAt = now;
+    while (budget > 0 && this.queue.length) {
+      var head = this.queue[0];
+      var avail = head.byteLength - this.headOffset;
+      var take = Math.min(avail, budget);
+      this.destination.write(head.subarray(this.headOffset, this.headOffset + take));
+      this.headOffset += take;
+      this.queuedBytes -= take;
+      budget -= take;
+      if (this.headOffset >= head.byteLength) { this.queue.shift(); this.headOffset = 0; }
+    }
+  };
+  MeteredSource.prototype._notifyComplete = function () {
+    if (this.notified || this.dead) return;
+    this.notified = true;
+    if (this.onCompletedCallback) this.onCompletedCallback(this);
+  };
+  MeteredSource.prototype._fail = function () {
+    this._notifyComplete();
+    this._cleanup();
+    try { if (this.socket) this.socket.close(); } catch (e) {}
+  };
+  MeteredSource.prototype._cleanup = function () {
+    if (this.feedTimer) { clearInterval(this.feedTimer); this.feedTimer = null; }
+  };
+  MeteredSource.prototype.destroy = function () {
+    // Silent by design: a completion callback fired synchronously from
+    // teardown would be mistaken for a genuine stream end.
+    this.dead = true;
+    this._cleanup();
+    try { if (this.socket) this.socket.close(); } catch (e) {}
+  };
+  // ==== end MeteredSource ====
+
   function startVideo(token) {
     var quality = $('quality').value;
     var useCombined = $('audioMode').value === 'combined';
@@ -634,7 +755,7 @@ main{padding:14px 18px 30px}
     // minutes into the previous video and stall detection goes blind.
     streamGen++; lastCt = -1; lastAdvanceAt = performance.now();
     lastByteSample = 0; lastByteSampleAt = 0; arrivalRate = 0;
-    var pl = new JSMpeg.Player(wsUrl, {
+    var playerOpts = {
       canvas: nc, audio: useCombined, streaming: true,
       // This JSMpeg build sizes its decoder buffers from these two options
       // (its old maxBufferSize option is ignored): 8 MB of video buffer is
@@ -710,7 +831,16 @@ main{padding:14px 18px 30px}
         $('npResume').disabled = true;
         updateSeekUI();
       }
-    });
+    };
+    if (!useCombined) {
+      // Compat mode: stage + meter the feed client-side (see
+      // MeteredSource). Combined mode keeps the stock source — its
+      // muxed audio clock already disciplines the picture.
+      playerOpts.source = MeteredSource;
+      playerOpts.meterBytesPerSec = streamBytesPerSec();
+      playerOpts.meterStageSec = isLiveStream ? 2 : 4;
+    }
+    var pl = new JSMpeg.Player(wsUrl, playerOpts);
     player = pl;
   }
 

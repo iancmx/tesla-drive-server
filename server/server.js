@@ -696,17 +696,22 @@ wss.on('connection', async (ws, req) => {
     ffmpeg.stdout.on('data', sendDirect);
   } else {
     // Delivery pacer for VOD (see the pacing note above): ffmpeg may
-    // produce at up to 2x, but the socket only releases a ~10
-    // media-second burst plus a ~1.1x realtime trickle. Produced chunks
-    // wait in a small queue; the existing close path flushes the queue
-    // before it reports the stream ended, so the tail is never cut.
+    // produce at up to 2x, but the socket releases media through a
+    // TOKEN BUCKET — the bucket starts with a ~1.5 media-second prime
+    // and refills at the stream's realtime rate, never accumulating
+    // more than the prime. A cumulative-allowance pacer banked budget
+    // during any production stall and dumped it all on recovery; the
+    // client player consumes media at arrival rate, so each dump
+    // played as a fast-forward burst followed by a freeze (reported
+    // from the car). Produced chunks wait in a queue; the close path
+    // flushes it before reporting the end, so the tail is never cut.
     const kbps = (parseInt(q.bitrate, 10) || 1100) + (combined ? 128 : 0);
     const bytesPerSec = kbps * 1000 / 8 * 1.06; // + MPEG-TS overhead
-    const burstBytes = 1.5 * bytesPerSec; // prime: ~1.5 media-seconds
+    const burstBytes = 1.5 * bytesPerSec; // bucket size = the prime
     const pending = [];
-    let pendingBytes = 0, sentBytes = 0, paceStart = 0;
+    let pendingBytes = 0, sentBytes = 0;
+    let paceBudget = burstBytes, lastDrainAt = Date.now();
     ffmpeg.stdout.on('data', (chunk) => {
-      if (!paceStart) paceStart = Date.now();
       pending.push(chunk); pendingBytes += chunk.length;
       if (pendingBytes > 16 * 1024 * 1024) { try { ffmpeg.stdout.pause(); } catch (e) {} }
     });
@@ -716,14 +721,16 @@ wss.on('connection', async (ws, req) => {
       // send failures below are swallowed by design, so check liveness
       // explicitly and tear the stream down.
       if (ws.readyState !== 1) { killFfmpeg(); return; }
-      const elapsedSec = paceStart ? (Date.now() - paceStart) / 1000 : 0;
-      const allowance = burstBytes + elapsedSec * 1.07 * bytesPerSec;
+      const nowMs = Date.now();
+      const dtSec = Math.min(0.25, Math.max(0, (nowMs - lastDrainAt) / 1000));
+      lastDrainAt = nowMs;
+      paceBudget = Math.min(burstBytes, paceBudget + dtSec * 1.07 * bytesPerSec);
       while (pending.length && ws.bufferedAmount < 16 * 1024 * 1024) {
         const next = pending[0];
-        if (sentBytes > 0 && sentBytes + next.length > allowance) break;
+        if (sentBytes > 0 && paceBudget < next.length) break;
         pending.shift(); pendingBytes -= next.length;
         try { ws.send(next); } catch (e) {}
-        sentBytes += next.length;
+        sentBytes += next.length; paceBudget -= next.length;
       }
       if (pendingBytes < 4 * 1024 * 1024) { try { ffmpeg.stdout.resume(); } catch (e) {} }
       if (ffmpegEnded && pendingBytes === 0) finishStream();

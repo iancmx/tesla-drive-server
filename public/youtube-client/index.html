@@ -214,7 +214,6 @@ main{padding:14px 18px 30px}
   var audioBaseSec = 0, initialAligned = false, audioHeldForBuffer = false;
   var bufferHoldSince = 0, lastKeeperAt = 0;
   var syncOffsetSec = 0, forceStarted = false, streamGen = 0, stablePlaySince = 0;
-  var keeperAudioHold = false, keeperVideoHold = false, keeperHoldUntil = 0;
   var lastByteSample = 0, lastByteSampleAt = 0, arrivalRate = 0, stallTimes = [];
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
@@ -511,20 +510,6 @@ main{padding:14px 18px 30px}
       if (bufferingNow) {
         setBufferingUI(true, arrivalRate ? 'Buffering… receiving ~' + arrivalRate.toFixed(1) + '× speed' : 'Buffering…');
       }
-      // Keeper-hold backstops: if a keeper resume was suppressed (a
-      // restart or hold intervened) and the pipe is STILL paused seconds
-      // later, nothing else will ever resume it — do it here.
-      if (keeperAudioHold && !audioHeldForBuffer && preRollDone && !bufferingNow &&
-          keeperHoldUntil && now > keeperHoldUntil + 2000 && na.paused && na.currentTime > 0 && !na.ended &&
-          $('audioMode').value === 'separate') {
-        keeperAudioHold = false; keeperHoldUntil = 0;
-        var bp = na.play(); if (bp && bp.catch) bp.catch(function () {});
-      }
-      if (keeperVideoHold && preRollDone && !bufferingNow && player &&
-          keeperHoldUntil && now > keeperHoldUntil + 2000) {
-        keeperVideoHold = false; keeperHoldUntil = 0;
-        try { player.play(); } catch (e) {}
-      }
       if (!preRollDone) {
         // The server meters delivery at exactly realtime (its
         // produced-ahead queue is the buffer; this player consumes
@@ -540,8 +525,8 @@ main{padding:14px 18px 30px}
           if (framesDecoded > 0) failedStarts = 0;
           setBufferingUI(false);
           if (!streamEnded) $('npState').textContent = 'Playing';
-          if (!streamEnded && $('audioMode').value === 'separate' && (audioHeldForBuffer || keeperAudioHold)) {
-            audioHeldForBuffer = false; keeperAudioHold = false; keeperHoldUntil = 0;
+          if (!streamEnded && $('audioMode').value === 'separate' && audioHeldForBuffer) {
+            audioHeldForBuffer = false;
             var rp = na.play(); if (rp && rp.catch) rp.catch(function () {});
           }
         }
@@ -603,8 +588,8 @@ main{padding:14px 18px 30px}
         bufferingNow = false; stablePlaySince = now;
         setBufferingUI(false);
         $('npState').textContent = 'Playing';
-        if (audioHeldForBuffer || keeperAudioHold) {
-          audioHeldForBuffer = false; keeperAudioHold = false; keeperHoldUntil = 0;
+        if (audioHeldForBuffer) {
+          audioHeldForBuffer = false;
           var pp = na.play(); if (pp && pp.catch) pp.catch(function () {});
         }
       }
@@ -648,7 +633,6 @@ main{padding:14px 18px 30px}
     // clock until reset: without this, a restart inherits a lastCt from
     // minutes into the previous video and stall detection goes blind.
     streamGen++; lastCt = -1; lastAdvanceAt = performance.now();
-    keeperAudioHold = false; keeperVideoHold = false; keeperHoldUntil = 0;
     lastByteSample = 0; lastByteSampleAt = 0; arrivalRate = 0;
     var pl = new JSMpeg.Player(wsUrl, {
       canvas: nc, audio: useCombined, streaming: true,
@@ -731,6 +715,7 @@ main{padding:14px 18px 30px}
   }
 
   function teardownStreams() {
+    try { na.playbackRate = 1; } catch (e) {}
     stopWatchdog();
     setBufferingUI(false);
     if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
@@ -794,6 +779,7 @@ main{padding:14px 18px 30px}
 
     // Separate (compat) mode: audio first (MP3 pipe, restarted at
     // baseTimeSec); video waits for it, like the original client.
+    try { na.playbackRate = 1; } catch (e) {}
     na.preload = 'none';
     na.src = '/api/audio?v=' + encodeURIComponent(it.id) + '&t=' + encodeURIComponent(baseTimeSec) + '&_=' + Date.now();
     na.load();
@@ -832,37 +818,31 @@ main{padding:14px 18px 30px}
       if (na.paused) return;
       if (isLiveStream) return; // live has no fixed timeline to correct against
       var now = performance.now();
-      if (now - lastKeeperAt < 5000) return;
       var audioPos = audioBaseSec + (na.currentTime || 0);
       var drift = (audioPos - syncOffsetSec) - (baseTimeSec + decodedSeconds()); // >0: audio ahead of target
-      if (Math.abs(drift) <= 0.35) return;
-      lastKeeperAt = now;
-      var gen = streamGen;
-      if (drift > 2.5 || drift < -8) { restartVideoAt(audioPos, token); return; }
-      if (drift > 0) {
-        // Audio ahead: hold it briefly and let the picture catch up.
-        keeperAudioHold = true;
-        try { na.pause(); } catch (e) {}
-        var holdMsA = Math.max(100, (drift - 0.15) * 1000);
-        keeperHoldUntil = performance.now() + holdMsA;
-        setTimeout(function () {
-          // A restart reuses this token but bumps streamGen; a buffering
-          // hold owns the audio meanwhile. Either way, don't resume.
-          if (token !== playSeq || gen !== streamGen || bufferingNow || audioHeldForBuffer) return;
-          keeperAudioHold = false; keeperHoldUntil = 0;
-          var p = na.play(); if (p && p.catch) p.catch(function () {});
-        }, holdMsA);
-      } else if (typeof player.pause === 'function') {
-        // Video ahead: freeze the picture briefly; audio keeps playing.
-        keeperVideoHold = true;
-        try { player.pause(); } catch (e) {}
-        var holdMsV = Math.max(100, (-drift - 0.15) * 1000);
-        keeperHoldUntil = performance.now() + holdMsV;
-        setTimeout(function () {
-          if (token !== playSeq || gen !== streamGen || bufferingNow || !player) return;
-          keeperVideoHold = false; keeperHoldUntil = 0;
-          try { player.play(); } catch (e) {}
-        }, holdMsV);
+      // Gross desync (a long stall, a dropped pipe) needs a restart —
+      // throttled so it can never spin.
+      if (Math.abs(drift) > 2.5) {
+        if (now - lastKeeperAt < 5000) return;
+        lastKeeperAt = now;
+        try { na.playbackRate = 1; } catch (e) {}
+        restartVideoAt(audioPos, token);
+        return;
+      }
+      // Everything smaller is a RATE error, not a position error: the
+      // video's pace comes from its metered feed (accurate to ~1%) and
+      // the audio element's pace is exact, so any residual skew shows
+      // up as slowly growing drift. Discipline the audio's rate
+      // continuously — a few percent either way, pitch-preserved — and
+      // the two stay locked. The old bang-bang corrections (pause the
+      // leading pipe for seconds at a time) are what the car showed as
+      // the picture stopping and resuming while the audio ran on.
+      var targetRate = 1;
+      if (Math.abs(drift) > 0.12) {
+        targetRate = 1 - Math.max(-0.08, Math.min(0.08, drift * 0.25));
+      }
+      if (Math.abs((na.playbackRate || 1) - targetRate) > 0.004) {
+        try { na.preservesPitch = true; na.playbackRate = targetRate; } catch (e) {}
       }
     }, 250);
 

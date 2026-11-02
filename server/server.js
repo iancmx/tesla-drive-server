@@ -717,7 +717,7 @@ wss.on('connection', async (ws, req) => {
       // explicitly and tear the stream down.
       if (ws.readyState !== 1) { killFfmpeg(); return; }
       const elapsedSec = paceStart ? (Date.now() - paceStart) / 1000 : 0;
-      const allowance = burstBytes + elapsedSec * 1.06 * bytesPerSec;
+      const allowance = burstBytes + elapsedSec * 1.07 * bytesPerSec;
       while (pending.length && ws.bufferedAmount < 16 * 1024 * 1024) {
         const next = pending[0];
         if (sentBytes > 0 && sentBytes + next.length > allowance) break;

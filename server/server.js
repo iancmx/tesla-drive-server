@@ -587,16 +587,20 @@ wss.on('connection', async (ws, req) => {
   });
 
   // Pacing: on-demand videos are encoded at a CAPPED 2x realtime
-  // (-readrate), with the first ~10 media-seconds delivered immediately
-  // (-readrate_initial_burst) for a fast pre-roll. The cap matters: an
-  // earlier fully-unpaced build flooded JSMpeg, whose A/V sync loop is
-  // built around a realtime-fed stream — the car reported audio racing
-  // ahead of the picture and heavy video stutter as it dropped frames
-  // trying to chase the audio clock. 2x still banks ~1s of buffer lead
-  // per second of playback (until the buffers/backpressure fill), which
-  // is what carries playback through network stalls. Live streams and
-  // direct ?url= sources stay at 1x (-re): there is no "ahead" to run
-  // to, and unpaced reads of a live edge just buffer-spin.
+  // (-readrate). The cap matters: an earlier fully-unpaced build flooded
+  // JSMpeg, whose sync loop is built around a realtime-fed stream — the
+  // car reported audio racing ahead of the picture and heavy stutter.
+  // But even a steady 2x DELIVERY is too much in Compat mode: the
+  // video-only JSMpeg player has no audio clock to throttle against, and
+  // the car showed the picture playing at visibly increased speed
+  // whenever a backlog built up, burning the bank and collapsing into
+  // Buffering every few seconds. So delivery is paced a second time,
+  // here in the WebSocket writer: the first ~10 media-seconds go out
+  // immediately (fast start / pre-roll), then the pipe is throttled to
+  // ~1.1x realtime — a small, steady lead the renderer cannot race
+  // through, which still outruns playback enough to absorb jitter.
+  // Live streams and direct ?url= sources stay at 1x end to end: there
+  // is no "ahead" to run to.
   const pacedRealtime = !!direct || isLive || process.env.FFMPEG_PACING === 'realtime';
   const paceArgs = pacedRealtime
     ? ['-re']
@@ -657,14 +661,15 @@ wss.on('connection', async (ws, req) => {
   activeStreams++;
   const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  // Backpressure: if the client falls behind, PAUSE ffmpeg's output pipe
-  // instead of dropping chunks. Dropping MPEG1 chunks corrupts the picture
-  // until the next keyframe (visible smearing/freezing); pausing lets TCP
-  // and the pipe throttle the encoder to what the client can consume. The
-  // window is deliberately wide (pause at 16 MB queued, resume at 4 MB)
-  // so an unpaced VOD encode can bank a real buffer lead in the client.
+  // Backpressure (all streams): if the client falls behind, PAUSE
+  // ffmpeg's output pipe instead of dropping chunks. Dropping MPEG1
+  // chunks corrupts the picture until the next keyframe (visible
+  // smearing/freezing); pausing lets TCP and the pipe throttle the
+  // encoder to what the client can consume.
   let bpTimer = null;
-  ffmpeg.stdout.on('data', (chunk) => {
+  let drainTimer = null;
+  let ffmpegEnded = false, ffmpegEndCode = null;
+  const sendDirect = (chunk) => {
     if (ws.readyState !== 1) return;
     try { ws.send(chunk); } catch (e) {}
     if (ws.bufferedAmount > 16 * 1024 * 1024 && !bpTimer) {
@@ -676,7 +681,44 @@ wss.on('connection', async (ws, req) => {
         }
       }, 100);
     }
-  });
+  };
+  if (pacedRealtime) {
+    ffmpeg.stdout.on('data', sendDirect);
+  } else {
+    // Delivery pacer for VOD (see the pacing note above): ffmpeg may
+    // produce at up to 2x, but the socket only releases a ~10
+    // media-second burst plus a ~1.1x realtime trickle. Produced chunks
+    // wait in a small queue; the existing close path flushes the queue
+    // before it reports the stream ended, so the tail is never cut.
+    const kbps = (parseInt(q.bitrate, 10) || 1100) + (combined ? 128 : 0);
+    const bytesPerSec = kbps * 1000 / 8 * 1.06; // + MPEG-TS overhead
+    const burstBytes = 10 * bytesPerSec;
+    const pending = [];
+    let pendingBytes = 0, sentBytes = 0, paceStart = 0;
+    ffmpeg.stdout.on('data', (chunk) => {
+      if (!paceStart) paceStart = Date.now();
+      pending.push(chunk); pendingBytes += chunk.length;
+      if (pendingBytes > 16 * 1024 * 1024) { try { ffmpeg.stdout.pause(); } catch (e) {} }
+    });
+    drainTimer = setInterval(() => {
+      // A client that vanished without a clean close (browser killed,
+      // network drop) must not leave a zombie transcode running: the
+      // send failures below are swallowed by design, so check liveness
+      // explicitly and tear the stream down.
+      if (ws.readyState !== 1) { killFfmpeg(); return; }
+      const elapsedSec = paceStart ? (Date.now() - paceStart) / 1000 : 0;
+      const allowance = burstBytes + elapsedSec * 1.1 * bytesPerSec;
+      while (pending.length && ws.bufferedAmount < 16 * 1024 * 1024) {
+        const next = pending[0];
+        if (sentBytes > 0 && sentBytes + next.length > allowance) break;
+        pending.shift(); pendingBytes -= next.length;
+        try { ws.send(next); } catch (e) {}
+        sentBytes += next.length;
+      }
+      if (pendingBytes < 4 * 1024 * 1024) { try { ffmpeg.stdout.resume(); } catch (e) {} }
+      if (ffmpegEnded && pendingBytes === 0) finishStream();
+    }, 50);
+  }
   // Keep the tail of ffmpeg's stderr: if it exits instantly (bad option,
   // dead input), the reason lands in the server log AND the client's
   // status line instead of a silent "Stream ended".
@@ -685,16 +727,30 @@ wss.on('connection', async (ws, req) => {
     stderrTail = (stderrTail + d.toString()).slice(-600);
   });
   ffmpeg.on('error', (e) => { sendJson({ type: 'error', message: e.message.slice(0, 120) }); });
-  ffmpeg.on('close', (code) => {
-    activeStreams--;
+  // finishStream reports the end exactly once — immediately for the
+  // direct path, or after the pacer queue has flushed for VOD, so the
+  // pacer can never truncate the tail of a finished video.
+  let streamFinished = false;
+  function finishStream() {
+    if (streamFinished) return;
+    streamFinished = true;
+    const code = ffmpegEndCode;
     if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
+    if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
     const tail = stderrTail.trim().split('\n').filter(Boolean).slice(-2).join(' | ').slice(0, 220);
     if (code !== 0 && tail) console.error('ffmpeg exited (code ' + code + '): ' + tail);
     sendJson({ type: 'status', message: 'Stream ended (code ' + code + ')' + (code !== 0 && tail ? ': ' + tail : '') });
     try { ws.close(); } catch (e) {}
+  }
+  ffmpeg.on('close', (code) => {
+    activeStreams--;
+    ffmpegEnded = true; ffmpegEndCode = code;
+    if (!drainTimer) finishStream(); // direct path: nothing queued
+    // pacer path: the drain loop calls finishStream once flushed
   });
   const killFfmpeg = () => {
     if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
+    if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
     try { ffmpeg.kill(); } catch (e) {}
   };
   ws.on('close', killFfmpeg);

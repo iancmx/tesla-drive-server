@@ -214,7 +214,7 @@ main{padding:14px 18px 30px}
   var audioBaseSec = 0, initialAligned = false, audioHeldForBuffer = false;
   var bufferHoldSince = 0, lastKeeperAt = 0;
   var syncOffsetSec = 0, forceStarted = false, streamGen = 0, stablePlaySince = 0;
-  var keeperAudioHold = false, keeperVideoHold = false;
+  var keeperAudioHold = false, keeperVideoHold = false, keeperHoldUntil = 0;
   var lastByteSample = 0, lastByteSampleAt = 0, arrivalRate = 0, stallTimes = [];
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
@@ -515,13 +515,14 @@ main{padding:14px 18px 30px}
       // restart or hold intervened) and the pipe is STILL paused seconds
       // later, nothing else will ever resume it — do it here.
       if (keeperAudioHold && !audioHeldForBuffer && preRollDone && !bufferingNow &&
-          now - lastKeeperAt > 4000 && na.paused && na.currentTime > 0 && !na.ended &&
+          keeperHoldUntil && now > keeperHoldUntil + 2000 && na.paused && na.currentTime > 0 && !na.ended &&
           $('audioMode').value === 'separate') {
-        keeperAudioHold = false;
+        keeperAudioHold = false; keeperHoldUntil = 0;
         var bp = na.play(); if (bp && bp.catch) bp.catch(function () {});
       }
-      if (keeperVideoHold && preRollDone && !bufferingNow && player && now - lastKeeperAt > 4000) {
-        keeperVideoHold = false;
+      if (keeperVideoHold && preRollDone && !bufferingNow && player &&
+          keeperHoldUntil && now > keeperHoldUntil + 2000) {
+        keeperVideoHold = false; keeperHoldUntil = 0;
         try { player.play(); } catch (e) {}
       }
       if (!preRollDone) {
@@ -542,7 +543,7 @@ main{padding:14px 18px 30px}
           setBufferingUI(false);
           if (!streamEnded) $('npState').textContent = 'Playing';
           if (!streamEnded && $('audioMode').value === 'separate' && (audioHeldForBuffer || keeperAudioHold)) {
-            audioHeldForBuffer = false; keeperAudioHold = false;
+            audioHeldForBuffer = false; keeperAudioHold = false; keeperHoldUntil = 0;
             var rp = na.play(); if (rp && rp.catch) rp.catch(function () {});
           }
         }
@@ -605,7 +606,7 @@ main{padding:14px 18px 30px}
         setBufferingUI(false);
         $('npState').textContent = 'Playing';
         if (audioHeldForBuffer || keeperAudioHold) {
-          audioHeldForBuffer = false; keeperAudioHold = false;
+          audioHeldForBuffer = false; keeperAudioHold = false; keeperHoldUntil = 0;
           var pp = na.play(); if (pp && pp.catch) pp.catch(function () {});
         }
       }
@@ -649,7 +650,7 @@ main{padding:14px 18px 30px}
     // clock until reset: without this, a restart inherits a lastCt from
     // minutes into the previous video and stall detection goes blind.
     streamGen++; lastCt = -1; lastAdvanceAt = performance.now();
-    keeperAudioHold = false; keeperVideoHold = false;
+    keeperAudioHold = false; keeperVideoHold = false; keeperHoldUntil = 0;
     lastByteSample = 0; lastByteSampleAt = 0; arrivalRate = 0;
     var pl = new JSMpeg.Player(wsUrl, {
       canvas: nc, audio: useCombined, streaming: true,
@@ -839,27 +840,31 @@ main{padding:14px 18px 30px}
       if (Math.abs(drift) <= 0.35) return;
       lastKeeperAt = now;
       var gen = streamGen;
-      if (Math.abs(drift) > 2.5) { restartVideoAt(audioPos, token); return; }
+      if (drift > 2.5 || drift < -8) { restartVideoAt(audioPos, token); return; }
       if (drift > 0) {
         // Audio ahead: hold it briefly and let the picture catch up.
         keeperAudioHold = true;
         try { na.pause(); } catch (e) {}
+        var holdMsA = Math.max(100, (drift - 0.15) * 1000);
+        keeperHoldUntil = performance.now() + holdMsA;
         setTimeout(function () {
           // A restart reuses this token but bumps streamGen; a buffering
           // hold owns the audio meanwhile. Either way, don't resume.
           if (token !== playSeq || gen !== streamGen || bufferingNow || audioHeldForBuffer) return;
-          keeperAudioHold = false;
+          keeperAudioHold = false; keeperHoldUntil = 0;
           var p = na.play(); if (p && p.catch) p.catch(function () {});
-        }, Math.max(100, (drift - 0.15) * 1000));
+        }, holdMsA);
       } else if (typeof player.pause === 'function') {
         // Video ahead: freeze the picture briefly; audio keeps playing.
         keeperVideoHold = true;
         try { player.pause(); } catch (e) {}
+        var holdMsV = Math.max(100, (-drift - 0.15) * 1000);
+        keeperHoldUntil = performance.now() + holdMsV;
         setTimeout(function () {
           if (token !== playSeq || gen !== streamGen || bufferingNow || !player) return;
-          keeperVideoHold = false;
+          keeperVideoHold = false; keeperHoldUntil = 0;
           try { player.play(); } catch (e) {}
-        }, Math.max(100, (-drift - 0.15) * 1000));
+        }, holdMsV);
       }
     }, 250);
 

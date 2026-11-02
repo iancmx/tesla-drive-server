@@ -590,15 +590,22 @@ wss.on('connection', async (ws, req) => {
   // (-readrate). The cap matters: an earlier fully-unpaced build flooded
   // JSMpeg, whose sync loop is built around a realtime-fed stream — the
   // car reported audio racing ahead of the picture and heavy stutter.
-  // But even a steady 2x DELIVERY is too much in Compat mode: the
-  // video-only JSMpeg player has no audio clock to throttle against, and
-  // the car showed the picture playing at visibly increased speed
-  // whenever a backlog built up, burning the bank and collapsing into
-  // Buffering every few seconds. So delivery is paced a second time,
-  // here in the WebSocket writer: the first ~10 media-seconds go out
-  // immediately (fast start / pre-roll), then the pipe is throttled to
-  // ~1.1x realtime — a small, steady lead the renderer cannot race
-  // through, which still outruns playback enough to absorb jitter.
+  // Delivery rate IS playback rate for this player: its streaming
+  // loop decodes (and renders) one picture per animation frame, so it
+  // consumes media as fast as data arrives, up to the display's frame
+  // cap (~2x for 30fps content on a 60Hz screen). Any faster-than-
+  // realtime feed therefore plays at increased speed — measured in a
+  // local harness and reported from the car — and any staged backlog
+  // is blasted through in seconds. So delivery is paced a second time,
+  // here in the WebSocket writer: a ~1.5 media-second prime for a fast
+  // start, then an exactly-realtime release (a few percent over the
+  // nominal byte rate, absorbing TS/PES overhead and rate-control
+  // slop so the delivered MEDIA rate is 1.00x — tuned in the harness:
+  // at 1.02 the picture ran at 0.96x). The encode is VBV-constrained CBR (see
+  // the ffmpeg args) so bytes track media time; the produced-ahead
+  // queue behind the pacer is the real buffer — it absorbs production
+  // and fetch jitter of many seconds without the client ever seeing
+  // a rate other than 1x.
   // Live streams and direct ?url= sources stay at 1x end to end: there
   // is no "ahead" to run to.
   const pacedRealtime = !!direct || isLive || process.env.FFMPEG_PACING === 'realtime';
@@ -622,6 +629,7 @@ wss.on('connection', async (ws, req) => {
       ...seekArgs(startSeconds), ...inputArgs, '-i', audioUrl,
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
+      '-minrate', q.bitrate, '-maxrate', q.bitrate, '-bufsize', (parseInt(q.bitrate, 10) * 2) + 'k',
       '-bf', '0', '-g', '30',
       '-vf', 'fps=30,scale=' + q.scale + ':force_original_aspect_ratio=decrease,pad=' + q.scale + ':(ow-iw)/2:(oh-ih)/2',
       '-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2',
@@ -635,6 +643,7 @@ wss.on('connection', async (ws, req) => {
       ...seekArgs(startSeconds), ...inputArgs, '-i', inputUrl,
       '-map', '0:v:0', '-map', '0:a:0?',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
+      '-minrate', q.bitrate, '-maxrate', q.bitrate, '-bufsize', (parseInt(q.bitrate, 10) * 2) + 'k',
       '-bf', '0', '-g', '30',
       '-vf', 'fps=30,scale=' + q.scale + ':force_original_aspect_ratio=decrease,pad=' + q.scale + ':(ow-iw)/2:(oh-ih)/2',
       '-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2',
@@ -646,6 +655,7 @@ wss.on('connection', async (ws, req) => {
     ffmpegArgs = [
       ...seekArgs(startSeconds), ...inputArgs, '-i', inputUrl, '-an',
       '-c:v', 'mpeg1video', '-q:v', '5', '-b:v', q.bitrate,
+      '-minrate', q.bitrate, '-maxrate', q.bitrate, '-bufsize', (parseInt(q.bitrate, 10) * 2) + 'k',
       '-bf', '0', '-g', '30',
       '-vf', 'fps=30,scale=' + q.scale + ':force_original_aspect_ratio=decrease,pad=' + q.scale + ':(ow-iw)/2:(oh-ih)/2',
       '-f', 'mpegts',
@@ -692,7 +702,7 @@ wss.on('connection', async (ws, req) => {
     // before it reports the stream ended, so the tail is never cut.
     const kbps = (parseInt(q.bitrate, 10) || 1100) + (combined ? 128 : 0);
     const bytesPerSec = kbps * 1000 / 8 * 1.06; // + MPEG-TS overhead
-    const burstBytes = 10 * bytesPerSec;
+    const burstBytes = 1.5 * bytesPerSec; // prime: ~1.5 media-seconds
     const pending = [];
     let pendingBytes = 0, sentBytes = 0, paceStart = 0;
     ffmpeg.stdout.on('data', (chunk) => {
@@ -707,7 +717,7 @@ wss.on('connection', async (ws, req) => {
       // explicitly and tear the stream down.
       if (ws.readyState !== 1) { killFfmpeg(); return; }
       const elapsedSec = paceStart ? (Date.now() - paceStart) / 1000 : 0;
-      const allowance = burstBytes + elapsedSec * 1.1 * bytesPerSec;
+      const allowance = burstBytes + elapsedSec * 1.06 * bytesPerSec;
       while (pending.length && ws.bufferedAmount < 16 * 1024 * 1024) {
         const next = pending[0];
         if (sentBytes > 0 && sentBytes + next.length > allowance) break;

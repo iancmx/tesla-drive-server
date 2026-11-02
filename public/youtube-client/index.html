@@ -499,10 +499,10 @@ main{padding:14px 18px 30px}
       var ct = decodedSeconds();
       if (ct > lastCt + 0.05) { lastCt = ct; lastAdvanceAt = now; }
       var banked = bufferedSecondsEstimate();
-      // Delivery rate in media-seconds per wall-second, sampled over a
-      // ~2s window: 2.0 is a healthy 2x feed, 1.0 is barely realtime,
-      // below that the picture MUST starve no matter what the client
-      // does. Shown in the Buffering label so a starving stream says why.
+      // Delivery rate in media-seconds per wall-second, sampled over
+      // a ~2s window: ~1.0 is a healthy metered feed, materially below
+      // that the picture MUST starve no matter what the client does.
+      // Shown in the Buffering label so a starving stream says why.
       if (lastByteSampleAt && now > lastByteSampleAt) {
         var bpsNow = streamBytesPerSec();
         if (bpsNow) arrivalRate = ((bytesReceived - lastByteSample) / bpsNow) / ((now - lastByteSampleAt) / 1000);
@@ -526,18 +526,16 @@ main{padding:14px 18px 30px}
         try { player.play(); } catch (e) {}
       }
       if (!preRollDone) {
-        // Start (well, reveal) playback only once a real lead is banked:
-        // ~10s for VOD, ~4s for live (which cannot run far ahead). The
-        // server produces at 2x realtime, so the bank keeps growing while
-        // playing. If the encoder can only manage realtime, don't trap
-        // the viewer: a few seconds of smooth decode or a 30s wait also
-        // releases the gate.
-        var target = isLiveStream ? 4 : 10;
+        // The server meters delivery at exactly realtime (its
+        // produced-ahead queue is the buffer; this player consumes
+        // media at arrival rate, so a client-side lead cannot exist).
+        // Reveal once decoding is demonstrably running — ~1.5
+        // media-seconds decoded — with a 15s no-trap fallback.
         if (player && bytesReceived === 0 && framesDecoded === 0 && now - playStartedAt > 20000) {
           setBufferingUI(true, 'No data from server — check: docker logs tesla-drive');
         }
         var anyData = bytesReceived > 0 || framesDecoded > 0;
-        if (banked >= target || (ct > 1 && banked >= 3) || (player && anyData && now - playStartedAt > 30000)) {
+        if (framesDecoded >= (isLiveStream ? 20 : 45) || (player && anyData && now - playStartedAt > 15000)) {
           preRollDone = true; bufferingNow = false; stablePlaySince = now;
           if (framesDecoded > 0) failedStarts = 0;
           setBufferingUI(false);
@@ -596,7 +594,7 @@ main{padding:14px 18px 30px}
           try { na.pause(); } catch (e) {}
           audioHeldForBuffer = true; bufferHoldSince = now;
         }
-      } else if (bufferingNow && (banked >= 6 || (now - lastAdvanceAt < 900 && banked >= 3))) {
+      } else if (bufferingNow && now - lastAdvanceAt < 900) {
         var framesFlowing = now - lastAdvanceAt < 900;
         if (audioHeldForBuffer && !framesFlowing && now - bufferHoldSince > 4000) {
           restartVideoAt(audioBaseSec + (na.currentTime || 0), token);

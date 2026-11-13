@@ -91,6 +91,9 @@ main{padding:14px 18px 30px}
 .watchctl{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px;background:var(--surface);border-radius:12px;padding:10px 14px}
 .watchctl .btn{background:#3d3d3d;border-radius:999px;padding:11px 18px;font-size:14.5px;font-weight:500;min-height:44px}
 .watchctl .btn-stop{background:#600}
+.bufbar{position:relative;height:4px;background:#26262c;border-radius:2px;margin:4px 0 2px}
+#bufFill{position:absolute;top:0;bottom:0;background:#5a5a64;border-radius:2px}
+#bufPlay{position:absolute;top:-2px;width:2px;height:8px;background:#fff}
 .watchctl label{color:var(--sub);font-size:13.5px}
 .watchctl input[type=range]{flex:1;min-width:110px;accent-color:var(--red);height:28px}
 .watchctl select{height:44px}
@@ -153,7 +156,9 @@ main{padding:14px 18px 30px}
       <input type="range" id="seek" min="0" max="0" step="1" value="0" disabled aria-label="Seek">
       <span class="time" id="timeDur">0:00</span>
     </div>
+    <div class="bufbar"><div id="bufFill"></div><div id="bufPlay"></div></div>
     <div class="watchctl">
+      <button class="btn" id="npPause" disabled>&#10074;&#10074; Pause</button>
       <button class="btn btn-stop" id="npStop">Stop</button>
       <button class="btn" id="npResume" disabled>Resume</button>
       <button class="btn" id="btnBack10" disabled>&#8722;10s</button>
@@ -205,6 +210,8 @@ main{padding:14px 18px 30px}
   // was decoded. Seeking = restart both pipes at a new baseTimeSec.
   var playSeq = 0, durationSec = null, isLiveStream = false;
   var baseTimeSec = 0, streamStartedAtMs = null, scrubbing = false, seekInFlight = false;
+  var clockOffsetSec = 0; // rebases the player's duration clock after a local (in-buffer) seek
+  var softPaused = false, pauseGraceTimer = null; // real-player pause: pipes stay alive, feed halted
   var lastItem = null, lastPosSec = 0, lastWasLive = false; // remembered on Stop so Resume can restart there
   // Buffer management: the server encodes VOD faster than realtime, so the
   // client can bank a lead. We estimate the bank from bytes received on the
@@ -467,12 +474,70 @@ main{padding:14px 18px 30px}
       seek.value = Math.floor(pos);
       $('timeNow').textContent = fmtDur(pos);
     }
+    var pb = $('npPause');
+    if (pb) {
+      pb.textContent = softPaused ? '\u25B6 Resume' : '\u275A\u275A Pause';
+      pb.disabled = !softPaused && !(cur && player && !isLiveStream && !seekInFlight &&
+        $('audioMode').value === 'separate' && player.source && player.source.pauseFeed);
+    }
+    var bf = $('bufFill'), bp = $('bufPlay');
+    if (bf && bp) {
+      var rng = (!isLiveStream && durationSec && player && player.source && player.source.getState) ? player.source.getState() : null;
+      if (rng && durationSec > 0) {
+        var bs = Math.max(0, Math.min(100, (baseTimeSec + rng.startSec) / durationSec * 100));
+        var be = Math.max(0, Math.min(100, (baseTimeSec + rng.endSec) / durationSec * 100));
+        bf.style.display = ''; bp.style.display = '';
+        bf.style.left = bs + '%'; bf.style.width = Math.max(0, be - bs) + '%';
+        bp.style.left = Math.max(0, Math.min(100, currentPosition() / durationSec * 100)) + '%';
+      } else { bf.style.display = 'none'; bp.style.display = 'none'; }
+    }
   }
   setInterval(updateSeekUI, 250);
   function seekTo(target) {
     if (!seekEnabled()) return;
     var t = Math.max(0, Math.min(Number(target) || 0, Math.max(0, durationSec - 0.3)));
+    if (softPaused) {
+      // Seeking out of a soft pause settles into the stopped state at
+      // the target (Resume restarts there) rather than juggling a
+      // paused decoder into a new position.
+      stopPlayback();
+      if (lastItem) {
+        lastPosSec = t;
+        $('npState').textContent = 'Stopped at ' + fmtDur(t) + ' — tap Resume';
+      }
+      return;
+    }
+    // Local seek: a target inside the retained buffer jumps the feed
+    // cursor to its keyframe — no restart, no reload.
+    if (player && player.source && typeof player.source.seekToSec === 'function') {
+      var streamTarget = t - baseTimeSec;
+      var st = player.source.getState();
+      if (streamTarget >= st.startSec - 0.001 && streamTarget <= st.endSec + 0.001) {
+        var res = player.source.seekToSec(streamTarget);
+        if (res) { applyLocalSeek(t, res); return; }
+      }
+    }
     startPlayback(cur, t);
+  }
+  function applyLocalSeek(t, res) {
+    // The player clock does not follow the jump (see decodedSeconds):
+    // rebase it so position reads as the keyframe we landed on, then
+    // advances with the newly decoded frames.
+    clockOffsetSec = res.keyframePts - rawPlayerClock();
+    lastCt = -1; lastAdvanceAt = performance.now();
+    lastKeeperAt = performance.now();
+    seekInFlight = true;
+    setTimeout(function () { seekInFlight = false; updateSeekUI(); }, 4000);
+    // Restart the cheap audio pipe at the target; the keeper trims
+    // the residual once frames are flowing.
+    if ($('audioMode').value === 'separate' && !isLiveStream && curId) {
+      audioBaseSec = t;
+      na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(t) + '&_=' + Date.now());
+      na.load();
+      var p = na.play(); if (p && p.catch) p.catch(function () {});
+    }
+    $('npState').textContent = 'Playing';
+    updateSeekUI();
   }
   function seekBy(delta) { seekTo(currentPosition() + delta); }
 
@@ -482,9 +547,16 @@ main{padding:14px 18px 30px}
     if (label) el.textContent = label;
     el.hidden = !show;
   }
-  function decodedSeconds() {
+  function rawPlayerClock() {
     if (player && typeof player.currentTime === 'number' && isFinite(player.currentTime) && player.currentTime > 0) return player.currentTime;
     return framesDecoded / 30;
+  }
+  function decodedSeconds() {
+    // player.currentTime is a decoded-DURATION clock (proven in the
+    // test harness): it does NOT follow feed jumps, so local seeks
+    // rebase it through clockOffsetSec and every position consumer —
+    // keeper, watchdog, UI, stop/resume — stays truthful.
+    return Math.max(0, rawPlayerClock() + clockOffsetSec);
   }
   function streamBytesPerSec() {
     var kbps = { '360': 700, '480': 1100, '720': 1800, '1080': 3500 }[$('quality').value] || 1100;
@@ -514,6 +586,7 @@ main{padding:14px 18px 30px}
     setBufferingUI(true, 'Buffering…');
     watchdogTimer = setInterval(function () {
       if (token !== playSeq || streamEnded) return;
+      if (softPaused) return; // a deliberate pause is not a stall
       attachByteCounter();
       var now = performance.now();
       var ct = decodedSeconds();
@@ -648,19 +721,25 @@ main{padding:14px 18px 30px}
     startVideo(token);
   }
 
-  // ==== MeteredSource ====
-  // A JSMpeg source that owns the WebSocket itself, STAGES a few
-  // seconds of stream, then meters it into the decoder at exactly
-  // realtime. Necessary because this player renders every picture the
-  // instant it decodes: media arriving in clumps (proxy buffering,
-  // cellular delivery, server catch-up) is otherwise played as
-  // fast-forward bursts between freezes, no matter how carefully the
-  // far end paces — the clumping happens downstream of the server.
-  // The stage absorbs the clumps; the meter guarantees a 1.0x feed.
-  // Implements the bundle's source contract (connect/start/destroy,
-  // established/progress, onSourceEstablished/onSourceCompleted via
-  // options) and exposes .socket so the byte counter keeps working.
-  function MeteredSource(url, options) {
+  // ==== BufferedSource ====
+  // A JSMpeg source that owns the WebSocket and RETAINS the stream in
+  // a client-side buffer with a playhead — the foundation for
+  // real-player behavior. The player renders every picture the instant
+  // it decodes, so media is metered out of the buffer at exactly
+  // realtime (a staged prime absorbs clumped arrival from proxies /
+  // cellular, as before). On top of that, the buffer makes operations
+  // local: pausing halts the meter while the buffer keeps filling,
+  // resuming is instant, and seeking inside the retained range jumps
+  // the feed cursor to the target keyframe (located via a running
+  // TS/PES index: PAT/PMT -> video PID -> PES PTS + MPEG1 picture
+  // type) instead of restarting the stream. Retention is capped
+  // (~48 MB); past the cap the tail is dropped and the stream ends
+  // gracefully at the buffer's end, where the client's normal
+  // auto-resume takes over. Implements the bundle's source contract
+  // (connect/start/destroy, established/progress, the onSource*
+  // callbacks via options) and exposes .socket (byte counter) and
+  // .queuedBytes (unfed bytes; the watchdog's starvation gauge).
+  function BufferedSource(url, options) {
     this.url = url;
     this.options = options || {};
     this.streaming = true;
@@ -673,23 +752,45 @@ main{padding:14px 18px 30px}
     this.socket = null;
     this.dead = false;
     this.notified = false;
-    this.queue = [];
-    this.queuedBytes = 0;
-    this.headOffset = 0;
-    this.feeding = false;
-    this.feedTimer = null;
-    this.lastFeedAt = 0;
     var bps = this.options.meterBytesPerSec || 150000;
     this.meterBps = bps;
     this.stageBytes = bps * (this.options.meterStageSec || 4);
     this.feedBps = bps * 1.03;
+    // Retained buffer and feed cursor, in absolute stream bytes.
+    this.chunks = [];
+    this.bufStart = 0;
+    this.bufBytes = 0;
+    this.cursor = 0;
+    this._curIdx = 0;
+    this._curOff = 0;
+    this.queuedBytes = 0;
+    this.feeding = false;
+    this.feedPaused = false;
+    this.feedTimer = null;
+    this.lastFeedAt = 0;
+    this.catchupBytes = 0;
+    this.maxBufferBytes = 48 * 1024 * 1024;
+    this.backWindowBytes = Math.floor(bps * 60);
+    this.tailDropped = false;
+    this.ended = false;
+    // TS index state.
+    this.keyframes = []; // {byte, pts} pts is stream-relative seconds
+    this.ptsBase = null;
+    this.tailSec = 0;
+    this._scanPend = null;
+    this._scanBase = 0;
+    this._pmtPid = null;
+    this._videoPid = null;
+    this._pesParts = null;
+    this._pesPts = null;
+    this._pesByte = 0;
   }
-  MeteredSource.prototype.connect = function (destination) {
+  BufferedSource.prototype.connect = function (destination) {
     this.destination = destination;
     this._open();
   };
-  MeteredSource.prototype.start = function () { this._open(); };
-  MeteredSource.prototype._open = function () {
+  BufferedSource.prototype.start = function () { this._open(); };
+  BufferedSource.prototype._open = function () {
     if (this.socket || this.dead) return;
     var self = this;
     var ws;
@@ -705,17 +806,132 @@ main{padding:14px 18px 30px}
         if (self.hookOnEstablished) self.hookOnEstablished();
         if (self.onEstablishedCallback) self.onEstablishedCallback(self);
       }
-      if (typeof ev.data === 'string') return; // status JSON: not media; the demuxer only resyncs over it
+      if (typeof ev.data === 'string') return; // status JSON: not media
       var u8 = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
-      self.queue.push(u8);
-      self.queuedBytes += u8.byteLength;
-      if (self.queuedBytes > self.meterBps * 45) { self._fail(); return; }
+      if (self.tailDropped) return;
+      if (self.bufBytes + u8.byteLength > self.maxBufferBytes) {
+        // Retention cap reached (a long pause, or hours of drift):
+        // stop taking media; playback ends at the retained tail and
+        // the client's auto-resume restarts from there.
+        self.tailDropped = true;
+        return;
+      }
+      self._scan(u8, self.bufStart + self.bufBytes);
+      self.chunks.push(u8);
+      self.bufBytes += u8.byteLength;
+      self.queuedBytes = (self.bufStart + self.bufBytes) - self.cursor;
       self._maybeFeed();
     };
-    ws.onclose = function () { self._notifyComplete(); self._cleanup(); };
+    ws.onclose = function () { self.ended = true; self._notifyComplete(); self._cleanup(); };
     ws.onerror = function () { /* onclose follows */ };
   };
-  MeteredSource.prototype._maybeFeed = function () {
+  // ---- TS/PES keyframe index -------------------------------------
+  BufferedSource.prototype._scan = function (u8, absStart) {
+    var data;
+    if (this._scanPend && this._scanPend.byteLength) {
+      data = new Uint8Array(this._scanPend.byteLength + u8.byteLength);
+      data.set(this._scanPend, 0);
+      data.set(u8, this._scanPend.byteLength);
+    } else {
+      data = u8;
+      this._scanBase = absStart;
+    }
+    var base = this._scanBase;
+    var off = 0;
+    if (this.ptsBase === null && this._videoPid === null) {
+      // Find the 188-byte sync alignment once.
+      var found = -1;
+      for (var i = 0; i + 376 < data.byteLength; i++) {
+        if (data[i] === 0x47 && data[i + 188] === 0x47 && data[i + 376] === 0x47) { found = i; break; }
+      }
+      if (found < 0) { this._scanPend = data.slice(-376); this._scanBase = base + data.byteLength - this._scanPend.byteLength; return; }
+      off = found;
+    }
+    for (; off + 188 <= data.byteLength; off += 188) {
+      this._packet(data.subarray(off, off + 188), base + off);
+    }
+    this._scanPend = data.slice(off);
+    this._scanBase = base + off;
+  };
+  BufferedSource.prototype._packet = function (p, absOff) {
+    var pusi = (p[1] & 0x40) !== 0;
+    var pid = ((p[1] & 0x1f) << 8) | p[2];
+    var afc = (p[3] >> 4) & 3;
+    if (afc === 2) return;
+    var start = 4;
+    if (afc === 3) start = 5 + p[4];
+    var payload = p.subarray(start);
+    if (pid === 0) {
+      if (pusi && payload.byteLength > 11) {
+        var sec = payload.subarray(1 + payload[0]);
+        if (sec.byteLength > 11) this._pmtPid = ((sec[10] & 0x1f) << 8) | sec[11];
+      }
+      return;
+    }
+    if (this._pmtPid !== null && pid === this._pmtPid) {
+      if (pusi && payload.byteLength > 1) {
+        var s2 = payload.subarray(1 + payload[0]);
+        if (s2.byteLength > 12) {
+          var progInfoLen = ((s2[10] & 0x0f) << 8) | s2[11];
+          var q = 12 + progInfoLen;
+          while (q + 5 <= s2.byteLength - 4) {
+            var st = s2[q];
+            var epid = ((s2[q + 1] & 0x1f) << 8) | s2[q + 2];
+            var esLen = ((s2[q + 3] & 0x0f) << 8) | s2[q + 4];
+            if (st === 0x01 || st === 0x02) this._videoPid = epid;
+            q += 5 + esLen;
+          }
+        }
+      }
+      return;
+    }
+    if (this._videoPid === null || pid !== this._videoPid) return;
+    if (pusi) {
+      this._flushPes();
+      this._pesByte = absOff;
+      this._pesPts = null;
+      this._pesParts = null;
+      if (payload.byteLength > 9 && payload[0] === 0 && payload[1] === 0 && payload[2] === 1) {
+        var flags2 = payload[7];
+        var hdrLen = payload[8];
+        if ((flags2 >> 6) === 2 || (flags2 >> 6) === 3) {
+          var b = payload.subarray(9);
+          if (b.byteLength >= 5) {
+            this._pesPts = (((b[0] & 0x0e) / 2) * 1073741824 + b[1] * 4194304 +
+              ((b[2] & 0xfe) / 2) * 32768 + b[3] * 128 + (b[4] & 0xfe) / 2) / 90000;
+          }
+        }
+        var rest = payload.subarray(Math.min(payload.byteLength, 9 + hdrLen));
+        if (rest.byteLength) this._pesParts = [rest];
+      }
+    } else if (this._pesParts) {
+      this._pesParts.push(payload);
+    }
+  };
+  BufferedSource.prototype._flushPes = function () {
+    if (!this._pesParts || !this._pesParts.length || this._pesPts === null) { this._pesParts = null; return; }
+    var total = 0, i;
+    for (i = 0; i < this._pesParts.length; i++) total += this._pesParts[i].byteLength;
+    var pes = new Uint8Array(total);
+    var o = 0;
+    for (i = 0; i < this._pesParts.length; i++) { pes.set(this._pesParts[i], o); o += this._pesParts[i].byteLength; }
+    this._pesParts = null;
+    if (this.ptsBase === null) this.ptsBase = this._pesPts;
+    var rel = this._pesPts - this.ptsBase;
+    if (rel > this.tailSec) this.tailSec = rel;
+    // The picture start code sits in the first bytes of the PES
+    // payload (after any sequence/GOP headers). Type 1 = I-frame.
+    var lim = Math.min(pes.byteLength - 6, 256);
+    for (i = 0; i < lim; i++) {
+      if (pes[i] === 0 && pes[i + 1] === 0 && pes[i + 2] === 1 && pes[i + 3] === 0) {
+        var type = (pes[i + 5] >> 3) & 7;
+        if (type === 1) this.keyframes.push({ byte: this._pesByte, pts: rel });
+        break;
+      }
+    }
+  };
+  // ---- feeding ----------------------------------------------------
+  BufferedSource.prototype._maybeFeed = function () {
     if (this.feeding || this.dead) return;
     if (this.queuedBytes < this.stageBytes) return;
     this.feeding = true;
@@ -723,43 +939,113 @@ main{padding:14px 18px 30px}
     var self = this;
     this.feedTimer = setInterval(function () { self._drain(); }, 50);
   };
-  MeteredSource.prototype._drain = function () {
+  BufferedSource.prototype._drain = function () {
     if (this.dead || !this.destination) return;
     var now = performance.now();
-    var budget = this.feedBps * (now - this.lastFeedAt) / 1000;
+    var dt = (now - this.lastFeedAt) / 1000;
     this.lastFeedAt = now;
-    while (budget > 0 && this.queue.length) {
-      var head = this.queue[0];
-      var avail = head.byteLength - this.headOffset;
+    if (this.feedPaused) return;
+    var rate = this.feedBps * (this.catchupBytes > 0 ? 6 : 1);
+    var budget = rate * dt;
+    while (budget > 0 && this._curIdx < this.chunks.length) {
+      var head = this.chunks[this._curIdx];
+      var avail = head.byteLength - this._curOff;
       var take = Math.min(avail, budget);
-      this.destination.write(head.subarray(this.headOffset, this.headOffset + take));
-      this.headOffset += take;
+      this.destination.write(head.subarray(this._curOff, this._curOff + take));
+      this._curOff += take;
+      this.cursor += take;
       this.queuedBytes -= take;
       budget -= take;
-      if (this.headOffset >= head.byteLength) { this.queue.shift(); this.headOffset = 0; }
+      if (this.catchupBytes > 0) this.catchupBytes -= take;
+      if (this._curOff >= head.byteLength) { this._curIdx++; this._curOff = 0; }
+    }
+    if (this._curIdx >= this.chunks.length && this.tailDropped) { this._fail(); return; }
+    this._dropBehind();
+  };
+  BufferedSource.prototype._dropBehind = function () {
+    var floor = this.cursor - this.backWindowBytes;
+    var removed = 0;
+    while (this.chunks.length > 1 && removed < this._curIdx) {
+      var len = this.chunks[0].byteLength;
+      if (this.bufStart + len > floor) break;
+      this.chunks.shift();
+      this.bufStart += len;
+      this.bufBytes -= len;
+      removed++;
+    }
+    if (removed) {
+      this._curIdx -= removed;
+      while (this.keyframes.length && this.keyframes[0].byte < this.bufStart) this.keyframes.shift();
     }
   };
-  MeteredSource.prototype._notifyComplete = function () {
+  // ---- player controls ---------------------------------------------
+  BufferedSource.prototype.pauseFeed = function () { this.feedPaused = true; };
+  BufferedSource.prototype.resumeFeed = function () {
+    this.feedPaused = false;
+    this.lastFeedAt = performance.now();
+  };
+  // Jump the feed cursor to the keyframe at or before stream-relative
+  // second `sec`. Returns {keyframePts, targetSec}, or null when the
+  // target is outside the retained range.
+  BufferedSource.prototype.seekToSec = function (sec) {
+    var kf = null;
+    for (var i = 0; i < this.keyframes.length; i++) {
+      if (this.keyframes[i].pts <= sec + 0.001) kf = this.keyframes[i];
+      else break;
+    }
+    if (!kf || kf.byte < this.bufStart) return null;
+    // Locate the cursor inside the chunk list.
+    var acc = this.bufStart, idx = 0;
+    while (idx < this.chunks.length && acc + this.chunks[idx].byteLength <= kf.byte) {
+      acc += this.chunks[idx].byteLength;
+      idx++;
+    }
+    if (idx >= this.chunks.length) return null;
+    this._curIdx = idx;
+    this._curOff = kf.byte - acc;
+    this.cursor = kf.byte;
+    this.queuedBytes = (this.bufStart + this.bufBytes) - this.cursor;
+    this.catchupBytes = Math.max(0, Math.floor((sec - kf.pts) * this.meterBps));
+    this.lastFeedAt = performance.now();
+    return { keyframePts: kf.pts, targetSec: sec };
+  };
+  // Buffered range + playhead estimate, stream-relative seconds.
+  BufferedSource.prototype.getState = function () {
+    var playhead = 0;
+    for (var i = 0; i < this.keyframes.length; i++) {
+      if (this.keyframes[i].byte <= this.cursor) {
+        playhead = this.keyframes[i].pts + (this.cursor - this.keyframes[i].byte) / this.meterBps;
+      } else break;
+    }
+    return {
+      startSec: this.keyframes.length ? this.keyframes[0].pts : 0,
+      endSec: this.tailSec,
+      playheadSec: playhead,
+      unfedSec: this.queuedBytes / this.meterBps,
+      keyframes: this.keyframes.length
+    };
+  };
+  BufferedSource.prototype._notifyComplete = function () {
     if (this.notified || this.dead) return;
     this.notified = true;
     if (this.onCompletedCallback) this.onCompletedCallback(this);
   };
-  MeteredSource.prototype._fail = function () {
+  BufferedSource.prototype._fail = function () {
     this._notifyComplete();
     this._cleanup();
     try { if (this.socket) this.socket.close(); } catch (e) {}
   };
-  MeteredSource.prototype._cleanup = function () {
+  BufferedSource.prototype._cleanup = function () {
     if (this.feedTimer) { clearInterval(this.feedTimer); this.feedTimer = null; }
   };
-  MeteredSource.prototype.destroy = function () {
+  BufferedSource.prototype.destroy = function () {
     // Silent by design: a completion callback fired synchronously from
     // teardown would be mistaken for a genuine stream end.
     this.dead = true;
     this._cleanup();
     try { if (this.socket) this.socket.close(); } catch (e) {}
   };
-  // ==== end MeteredSource ====
+  // ==== end BufferedSource ====
 
   function startVideo(token) {
     var quality = $('quality').value;
@@ -776,6 +1062,7 @@ main{padding:14px 18px 30px}
     // clock until reset: without this, a restart inherits a lastCt from
     // minutes into the previous video and stall detection goes blind.
     streamGen++; lastCt = -1; lastAdvanceAt = performance.now();
+    clockOffsetSec = 0;
     lastByteSample = 0; lastByteSampleAt = 0; arrivalRate = 0;
     var playerOpts = {
       canvas: nc, audio: useCombined, streaming: true,
@@ -822,6 +1109,13 @@ main{padding:14px 18px 30px}
       onStalled: function () { /* the watchdog notices via currentTime */ },
       onSourceCompleted: function () {
         if (player !== pl || token !== playSeq) return;
+        if (softPaused) {
+          // The held stream died under the pause (idle timeout,
+          // network drop): settle into the normal stopped state at
+          // the paused position instead of bursting into playback.
+          stopPlayback();
+          return;
+        }
         streamEnded = true;
         setBufferingUI(false);
         var failedStart = framesDecoded === 0;
@@ -855,10 +1149,10 @@ main{padding:14px 18px 30px}
       }
     };
     if (!useCombined) {
-      // Compat mode: stage + meter the feed client-side (see
-      // MeteredSource). Combined mode keeps the stock source — its
-      // muxed audio clock already disciplines the picture.
-      playerOpts.source = MeteredSource;
+      // Compat mode: the buffered source (stage + meter + local
+      // pause/seek; see BufferedSource). Combined mode keeps the
+      // stock source — its muxed audio clock disciplines the picture.
+      playerOpts.source = BufferedSource;
       playerOpts.meterBytesPerSec = streamBytesPerSec();
       playerOpts.meterStageSec = isLiveStream ? 2 : 4;
     }
@@ -868,6 +1162,8 @@ main{padding:14px 18px 30px}
 
   function teardownStreams() {
     try { na.playbackRate = 1; } catch (e) {}
+    softPaused = false;
+    if (pauseGraceTimer) { clearTimeout(pauseGraceTimer); pauseGraceTimer = null; }
     stopWatchdog();
     setBufferingUI(false);
     if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
@@ -966,7 +1262,7 @@ main{padding:14px 18px 30px}
         var fp = na.play(); if (fp && fp.catch) fp.catch(function () {});
         return;
       }
-      if (streamEnded || bufferingNow || !preRollDone || streamStartedAtMs == null) return;
+      if (softPaused || streamEnded || bufferingNow || !preRollDone || streamStartedAtMs == null) return;
       if (na.paused) return;
       if (isLiveStream) return; // live has no fixed timeline to correct against
       var now = performance.now();
@@ -1031,6 +1327,51 @@ main{padding:14px 18px 30px}
     startPlayback(it, pos);
   }
 
+  var PAUSE_GRACE_MS = 10 * 60 * 1000;
+  function softPause() {
+    if (!cur || !player || softPaused || isLiveStream) return;
+    if ($('audioMode').value !== 'separate') return;
+    var src = player.source;
+    if (!src || !src.pauseFeed) return;
+    softPaused = true;
+    try { src.pauseFeed(); } catch (e) {}
+    try { player.pause(); } catch (e) {}
+    try { na.pause(); } catch (e) {}
+    setBufferingUI(false);
+    $('npState').textContent = 'Paused';
+    if (pauseGraceTimer) clearTimeout(pauseGraceTimer);
+    pauseGraceTimer = setTimeout(function () {
+      pauseGraceTimer = null;
+      if (softPaused) stopPlayback(); // grace over: full stop, position kept
+    }, PAUSE_GRACE_MS);
+    updateSeekUI();
+  }
+  function softResume() {
+    if (!softPaused || !player) return;
+    softPaused = false;
+    if (pauseGraceTimer) { clearTimeout(pauseGraceTimer); pauseGraceTimer = null; }
+    var src = player.source;
+    // The audio pipe may have died while held (proxy idle timeouts,
+    // stalled connection): restart it at the picture's position if it
+    // looks dead; otherwise it resumes from its own held buffer.
+    var pos = currentPosition();
+    var audioDead = !curId || na.ended || !!na.error || na.readyState === 0 || na.networkState === 3;
+    if (audioDead && curId && !isLiveStream) {
+      audioBaseSec = pos;
+      na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(pos) + '&_=' + Date.now());
+      na.load();
+    }
+    var p = na.play(); if (p && p.catch) p.catch(function () {});
+    if (src && src.resumeFeed) { try { src.resumeFeed(); } catch (e) {} }
+    try { player.play(); } catch (e) {}
+    lastCt = -1; lastAdvanceAt = performance.now();
+    lastKeeperAt = performance.now();
+    $('npState').textContent = 'Playing';
+    updateSeekUI();
+  }
+  function togglePause() { if (softPaused) softResume(); else softPause(); }
+
+  $('npPause').onclick = togglePause;
   $('npStop').onclick = stopPlayback;
   $('npResume').onclick = resumePlayback;
   $('btnBack').onclick = showHome;

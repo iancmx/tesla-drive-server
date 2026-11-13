@@ -45,6 +45,7 @@ select{background:#121212;color:var(--text);border:1px solid var(--border);borde
 .chips::-webkit-scrollbar{display:none}
 .chip{flex:none;background:var(--chip);border-radius:8px;padding:11px 16px;font-size:14px;font-weight:500;min-height:42px;white-space:nowrap}
 .chip.active{background:#f1f1f1;color:#0f0f0f}
+.chip.personal{box-shadow:inset 0 0 0 1px var(--red)}
 
 /* ---- home grid ---- */
 main{padding:14px 18px 30px}
@@ -389,6 +390,26 @@ main{padding:14px 18px 30px}
       wrap.appendChild(b);
     });
   })();
+
+  // Personalized chips — Subscriptions, Watch Later, Liked, History —
+  // exist only when the server holds the owner's YouTube cookies
+  // (/api/session reports presence, never contents). They read
+  // through the same grid as search and trending.
+  fetch(withKey('/api/session')).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d || !d.ok || !d.cookies) return;
+    var wrap = $('chips');
+    [['Subscriptions', 'subscriptions'], ['Watch Later', 'watchlater'],
+     ['Liked', 'liked'], ['History', 'history']].forEach(function (pair) {
+      var b = document.createElement('button');
+      b.className = 'chip personal';
+      b.textContent = pair[0];
+      b.onclick = function () {
+        setActiveChip(pair[0]);
+        getJson('/api/feed?kind=' + pair[1], pair[0]);
+      };
+      wrap.appendChild(b);
+    });
+  }).catch(function () {});
 
   // ---- watch view switching ----
   function showWatch() {

@@ -390,6 +390,56 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+// ---- Personalized feeds (the owner's YouTube session) -----------------------
+// With a cookies.txt in place (YT_DLP_COOKIES), yt-dlp can read the
+// surfaces YouTube only shows a signed-in user. This is the closest
+// thing to "logging in" that exists for this app: Google's Data API
+// does not expose the personalized home feed at all, and embedding
+// the real site would use a <video> element (paused in Drive).
+const PERSONAL_FEEDS = {
+  subscriptions: 'https://www.youtube.com/feed/subscriptions',
+  watchlater: 'https://www.youtube.com/playlist?list=WL',
+  liked: 'https://www.youtube.com/playlist?list=LL',
+  history: 'https://www.youtube.com/feed/history',
+};
+function hasCookies() { return cookieArgs().length > 0; }
+
+app.get('/api/session', (req, res) => {
+  // Presence only — the client shows the personalized chips when a
+  // cookies file exists. The file's contents never leave the server.
+  res.json({ ok: true, cookies: hasCookies() });
+});
+
+app.get('/api/feed', async (req, res) => {
+  const kind = String(req.query.kind || '');
+  const url = PERSONAL_FEEDS[kind];
+  if (!url) return res.status(400).json({ ok: false, error: 'Unknown feed' });
+  if (!hasCookies()) {
+    return res.status(400).json({ ok: false, error: 'no-cookies',
+      detail: 'add cookies.txt (your logged-in YouTube session) to the config folder to use personalized feeds' });
+  }
+  try {
+    const out = await ytDlp(['--flat-playlist', '--playlist-end', '30', '--no-warnings', '-J',
+      ...cookieArgs(), url], 45000);
+    const data = JSON.parse(out);
+    const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
+    if (!results.length) {
+      // A live session with subscriptions never returns an empty
+      // feed; empty here means YouTube treated us as signed out.
+      return res.status(502).json({ ok: false, error: 'session-expired',
+        detail: 'YouTube returned nothing for this feed — the saved cookies are likely stale; re-export cookies.txt' });
+    }
+    res.json({ ok: true, source: 'yt-dlp', kind, results });
+  } catch (e) {
+    const authish = e.type === 'bot-blocked' || /sign in|login|cookies/i.test(String(e.stderr || ''));
+    if (authish) {
+      return res.status(502).json({ ok: false, error: 'session-expired',
+        detail: 'YouTube rejected the saved session — re-export cookies.txt from your logged-in browser' });
+    }
+    res.status(502).json({ ok: false, error: e.type || 'feed-failed', detail: e.stderr || '' });
+  }
+});
+
 // ---- Trending ---------------------------------------------------------------
 const PIPED_TRENDING = [
   'https://pipedapi.kavin.rocks/trending',

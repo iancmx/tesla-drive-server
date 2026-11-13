@@ -139,7 +139,11 @@ from the Docker tab. The template maps port 8742, `/config` →
 **Cookies (optional):** if YouTube bot-blocks your IP, export a Netscape
 `cookies.txt` from a signed-in browser and drop it in the appdata folder
 as `cookies.txt` (see `config/cookies.txt.example`). The server only
-passes it to yt-dlp when the file exists.
+passes it to yt-dlp when the file exists. The same file also unlocks
+the personalized feeds: when cookies are present, the client shows
+Subscriptions, Watch Later, Liked and History chips, read through
+yt-dlp with your session. Sessions expire — when a feed starts
+reporting "session-expired", re-export the file.
 
 **Remote access / reverse proxy:** because everything is same-origin on
 one port, Nginx Proxy Manager, SWAG, or any single proxy host rule covers

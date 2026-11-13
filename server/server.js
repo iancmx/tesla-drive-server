@@ -397,6 +397,7 @@ app.get('/api/search', async (req, res) => {
 // does not expose the personalized home feed at all, and embedding
 // the real site would use a <video> element (paused in Drive).
 const PERSONAL_FEEDS = {
+  foryou: 'https://www.youtube.com/feed/recommended',
   subscriptions: 'https://www.youtube.com/feed/subscriptions',
   watchlater: 'https://www.youtube.com/playlist?list=WL',
   liked: 'https://www.youtube.com/playlist?list=LL',
@@ -424,6 +425,15 @@ app.get('/api/feed', async (req, res) => {
     const data = JSON.parse(out);
     const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
     if (!results.length) {
+      if (kind === 'foryou') {
+        // The recommended tab is personalization-only: signed out it
+        // parses but yields nothing (verified). Empty on a request
+        // WITH cookies means the session didn't take — or YouTube
+        // stopped serving this surface this way; say so plainly
+        // rather than blaming the cookies outright.
+        return res.status(502).json({ ok: false, error: 'feed-empty',
+          detail: 'YouTube returned no recommendations — if this persists with freshly exported cookies, the For You surface may not be readable this way' });
+      }
       // A live session with subscriptions never returns an empty
       // feed; empty here means YouTube treated us as signed out.
       return res.status(502).json({ ok: false, error: 'session-expired',

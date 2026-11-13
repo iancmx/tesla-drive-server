@@ -141,7 +141,7 @@ from the Docker tab. The template maps port 8742, `/config` →
 as `cookies.txt` (see `config/cookies.txt.example`). The server only
 passes it to yt-dlp when the file exists. The same file also unlocks
 the personalized feeds: when cookies are present, the client shows
-Subscriptions, Watch Later, Liked and History chips, read through
+For You, Subscriptions, Watch Later, Liked and History chips, read through
 yt-dlp with your session. Sessions expire — when a feed starts
 reporting "session-expired", re-export the file.
 

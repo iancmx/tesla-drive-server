@@ -398,7 +398,7 @@ main{padding:14px 18px 30px}
   fetch(withKey('/api/session')).then(function (r) { return r.json(); }).then(function (d) {
     if (!d || !d.ok || !d.cookies) return;
     var wrap = $('chips');
-    [['Subscriptions', 'subscriptions'], ['Watch Later', 'watchlater'],
+    [['For You', 'foryou'], ['Subscriptions', 'subscriptions'], ['Watch Later', 'watchlater'],
      ['Liked', 'liked'], ['History', 'history']].forEach(function (pair) {
       var b = document.createElement('button');
       b.className = 'chip personal';

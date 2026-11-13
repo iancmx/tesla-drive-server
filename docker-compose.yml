@@ -40,7 +40,7 @@ services:
       # On Unraid point this at /mnt/user/appdata/tesla-drive instead.
       - ./config:/config
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8742/"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8742/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3

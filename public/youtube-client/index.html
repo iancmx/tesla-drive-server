@@ -224,6 +224,9 @@ main{padding:14px 18px 30px}
   var lastByteSample = 0, lastByteSampleAt = 0, arrivalRate = 0, stallTimes = [];
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
+  var syncHold = null; // freeze-and-release alignment hold while a restarted audio pipe loads
+  var calibStarted = false, calibDone = false; // startup sync-before-start calibration state
+  var audioRestartAt = 0; // last audio-pipe (re)start; its position is unmeasurable until it plays
 
   var CHIPS = ['All', 'Music', 'Gaming', 'News', 'Live', 'Technology', 'Cars', 'Comedy', 'Sports', 'Science', 'Travel'];
   var AVATAR_COLORS = ['#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0', '#00838f', '#2e7d32', '#f9a825', '#ef6c00', '#4e342e', '#546e7a'];
@@ -512,10 +515,15 @@ main{padding:14px 18px 30px}
     if (player && player.source && typeof player.source.seekToSec === 'function') {
       var streamTarget = t - baseTimeSec;
       var st = player.source.getState();
-      if (streamTarget >= st.startSec - 0.001 && streamTarget <= st.endSec + 0.001) {
+      if (streamTarget <= st.endSec + 0.001) {
         var res = player.source.seekToSec(streamTarget);
         if (res) { applyLocalSeek(t, res); return; }
       }
+      // Falling through to a full restart: record why, so the next
+      // car report carries the state that decided it.
+      beaconDiag('seek-restart', { target: +t.toFixed(1), streamTarget: +streamTarget.toFixed(1),
+        startSec: +st.startSec.toFixed(1), endSec: +st.endSec.toFixed(1), keyframes: st.keyframes,
+        baseTimeSec: baseTimeSec, durationSec: durationSec });
     }
     startPlayback(cur, t);
   }
@@ -527,16 +535,25 @@ main{padding:14px 18px 30px}
     lastCt = -1; lastAdvanceAt = performance.now();
     lastKeeperAt = performance.now();
     seekInFlight = true;
-    setTimeout(function () { seekInFlight = false; updateSeekUI(); }, 4000);
-    // Restart the cheap audio pipe at the target; the keeper trims
-    // the residual once frames are flowing.
+    setTimeout(function () { if (!syncHold) { seekInFlight = false; updateSeekUI(); } }, 4000);
     if ($('audioMode').value === 'separate' && !isLiveStream && curId) {
-      audioBaseSec = t;
-      na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(t) + '&_=' + Date.now());
+      // Restart the audio pipe at the KEYFRAME we landed on and
+      // freeze the picture there until the pipe is playing (the sync
+      // tick releases the hold). The pipe's resolve latency used to
+      // land as drift the moment it started, and seconds after the
+      // seek the keeper's gross-desync branch restarted the whole
+      // video — an in-buffer seek that looked exactly like a reload.
+      var target = baseTimeSec + res.keyframePts;
+      audioBaseSec = target;
+      audioRestartAt = performance.now();
+      na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(target) + '&_=' + Date.now());
       na.load();
       var p = na.play(); if (p && p.catch) p.catch(function () {});
+      beginSyncHold(6000);
+      $('npState').textContent = 'Syncing audio…';
+    } else {
+      $('npState').textContent = 'Playing';
     }
-    $('npState').textContent = 'Playing';
     updateSeekUI();
   }
   function seekBy(delta) { seekTo(currentPosition() + delta); }
@@ -578,6 +595,45 @@ main{padding:14px 18px 30px}
       });
     } catch (err) {}
   }
+  // Silent diagnostics: when a seek or the sync keeper still falls
+  // back to a full restart, record WHY (a state snapshot) server-side,
+  // so a report from the car comes with evidence, not guesswork.
+  function beaconDiag(kind, data) {
+    try {
+      var body = JSON.stringify({ kind: kind, at: new Date().toISOString(), data: data || {} });
+      if (navigator.sendBeacon) navigator.sendBeacon(withKey('/api/probe-report'), new Blob([body], { type: 'application/json' }));
+      else fetch(withKey('/api/probe-report'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body }).catch(function () {});
+    } catch (e) {}
+  }
+  function audioPlaying() {
+    return !na.paused && na.readyState >= 2 && (na.currentTime || 0) > 0.02;
+  }
+  // Freeze-and-release alignment: hold the picture on its current
+  // frame while a restarted audio pipe loads, then release both
+  // together. A position restart of the audio pipe hides everything
+  // except its resolve latency (seconds of server-side yt-dlp) —
+  // unhidden, that latency used to land as A/V drift, and the sync
+  // keeper's gross-desync branch then restarted the whole video a
+  // few seconds after an in-buffer seek, making a local seek look
+  // exactly like a reload. Freezing through the latency turns it
+  // into a brief still frame on the right picture instead.
+  function beginSyncHold(deadlineMs) {
+    var src = player && player.source;
+    if (src && src.pauseFeed) { try { src.pauseFeed(); } catch (e) {} }
+    if (player) { try { player.pause(); } catch (e) {} }
+    syncHold = { deadline: performance.now() + (deadlineMs || 6000) };
+  }
+  function endSyncHold() {
+    if (!syncHold) return;
+    syncHold = null;
+    var src = player && player.source;
+    if (src && src.resumeFeed) { try { src.resumeFeed(); } catch (e) {} }
+    if (player) { try { player.play(); } catch (e) {} }
+    lastCt = -1; lastAdvanceAt = performance.now();
+    lastKeeperAt = performance.now();
+    seekInFlight = false;
+    updateSeekUI();
+  }
   function stopWatchdog() { if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; } }
   function startWatchdog(token) {
     stopWatchdog();
@@ -587,6 +643,7 @@ main{padding:14px 18px 30px}
     watchdogTimer = setInterval(function () {
       if (token !== playSeq || streamEnded) return;
       if (softPaused) return; // a deliberate pause is not a stall
+      if (syncHold) return; // an alignment hold is not a stall either
       attachByteCounter();
       var now = performance.now();
       var ct = decodedSeconds();
@@ -623,6 +680,48 @@ main{padding:14px 18px 30px}
         }
         var anyData = bytesReceived > 0 || framesDecoded > 0;
         if (framesDecoded >= (isLiveStream ? 20 : 45) || (player && anyData && now - playStartedAt > 15000)) {
+          // Sync-before-start (Compat mode): both clocks are finally
+          // running — measure the real startup offset NOW, while the
+          // buffering overlay still covers everything, and absorb it
+          // before anything is heard. The audio has been playing
+          // muted; if it is already within the keeper's deadband,
+          // just unmute and go. Otherwise freeze the picture, restart
+          // the audio pipe at the frozen position, and let the sync
+          // tick release both together when the pipe plays again.
+          if (!calibDone && $('audioMode').value === 'separate' && !isLiveStream) {
+            if (audioHeldForBuffer) { // a stall held the pipe before the first reveal; release it so it can be measured
+              audioHeldForBuffer = false;
+              var hp = na.play(); if (hp && hp.catch) hp.catch(function () {});
+            }
+            if (syncHold) return; // calibration restart in flight; the sync tick releases it
+            if (!calibStarted && audioPlaying() && framesDecoded > 0) {
+              var drift0 = (audioBaseSec + (na.currentTime || 0)) - (baseTimeSec + decodedSeconds());
+              if (Math.abs(drift0) <= 0.12 || now - playStartedAt > 20000) {
+                calibDone = true;
+                try { na.muted = false; } catch (e) {}
+              } else {
+                calibStarted = true;
+                var vidPos = baseTimeSec + decodedSeconds();
+                beginSyncHold(6000);
+                audioBaseSec = vidPos; audioRestartAt = now;
+                na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(vidPos) + '&_=' + Date.now());
+                na.load();
+                var cp = na.play(); if (cp && cp.catch) cp.catch(function () {});
+                setBufferingUI(true, 'Syncing audio…');
+                return;
+              }
+            } else if (calibStarted) {
+              // The hold was released by the sync tick (or timed
+              // out): the pipes now share a start position.
+              calibDone = true;
+              try { na.muted = false; } catch (e) {}
+            } else if (now - playStartedAt > 20000) {
+              calibDone = true; // audio never became measurable (force-start path): reveal anyway
+              try { na.muted = false; } catch (e) {}
+            } else {
+              return; // audio not measurable yet; stay in pre-roll (bounded by the checks above)
+            }
+          }
           preRollDone = true; bufferingNow = false; stablePlaySince = now;
           if (framesDecoded > 0) failedStarts = 0;
           setBufferingUI(false);
@@ -988,12 +1087,18 @@ main{padding:14px 18px 30px}
   // second `sec`. Returns {keyframePts, targetSec}, or null when the
   // target is outside the retained range.
   BufferedSource.prototype.seekToSec = function (sec) {
-    var kf = null;
+    // Beyond the arrived tail there is nothing to jump to (the
+    // caller falls back to a restart — correctly, that media hasn't
+    // loaded). Anything else lands on the nearest keyframe at or
+    // before the target, or on the first retained keyframe when the
+    // target precedes it.
+    if (!this.keyframes.length || sec > this.tailSec + 0.05) return null;
+    var kf = this.keyframes[0];
     for (var i = 0; i < this.keyframes.length; i++) {
       if (this.keyframes[i].pts <= sec + 0.001) kf = this.keyframes[i];
       else break;
     }
-    if (!kf || kf.byte < this.bufStart) return null;
+    if (kf.byte < this.bufStart) return null;
     // Locate the cursor inside the chunk list.
     var acc = this.bufStart, idx = 0;
     while (idx < this.chunks.length && acc + this.chunks[idx].byteLength <= kf.byte) {
@@ -1078,18 +1183,11 @@ main{padding:14px 18px 30px}
           streamStartedAtMs = performance.now();
           seekInFlight = false;
           updateSeekUI();
-          // Compat startup alignment: the audio pipe started playing while
-          // this video stream was still resolving/connecting, so it is
-          // ahead by that pipeline latency. Restart the video once, right
-          // at the audio's position, and the two start locked together.
-          if (!initialAligned && $('audioMode').value === 'separate') {
-            initialAligned = true;
-            var ap = audioBaseSec + (na.currentTime || 0);
-            if (!na.paused && ap > baseTimeSec + 0.75) {
-              var t2 = token;
-              setTimeout(function () { if (t2 === playSeq && cur) restartVideoAt(ap, t2); }, 50);
-            }
-          }
+          // Compat startup alignment is handled by the watchdog's
+          // sync-before-start calibration, which aligns the pipes
+          // before the reveal; the old first-frame video restart
+          // that used to happen here threw away the first stream
+          // and still left the convergence audible.
           // Combined mode: JSMpeg plays audio through WebAudio, which the
           // browser may start suspended — resume it inside playback.
           try {
@@ -1162,6 +1260,8 @@ main{padding:14px 18px 30px}
 
   function teardownStreams() {
     try { na.playbackRate = 1; } catch (e) {}
+    try { na.muted = false; } catch (e) {}
+    syncHold = null;
     softPaused = false;
     if (pauseGraceTimer) { clearTimeout(pauseGraceTimer); pauseGraceTimer = null; }
     stopWatchdog();
@@ -1186,6 +1286,7 @@ main{padding:14px 18px 30px}
     seekInFlight = baseTimeSec > 0;
     audioBaseSec = baseTimeSec; initialAligned = false;
     audioHeldForBuffer = false; lastKeeperAt = 0;
+    syncHold = null; calibStarted = false; calibDone = isLiveStream; audioRestartAt = 0;
     syncOffsetSec = 0; forceStarted = false; stablePlaySince = 0;
     if (!autoResume) { autoResumeAttempts = 0; stallTimes = []; }
     showWatch();
@@ -1228,9 +1329,16 @@ main{padding:14px 18px 30px}
     // Separate (compat) mode: audio first (MP3 pipe, restarted at
     // baseTimeSec); video waits for it, like the original client.
     try { na.playbackRate = 1; } catch (e) {}
+    // The audio starts MUTED: the watchdog's sync-before-start
+    // calibration measures the real A/V offset once both clocks are
+    // running and unmutes only when the pipes are aligned (or it
+    // gives up trying), so the first thing heard is never the
+    // out-of-sync part.
+    try { na.muted = true; } catch (e) {}
     na.preload = 'none';
     na.src = withKey('/api/audio?v=' + encodeURIComponent(it.id) + '&t=' + encodeURIComponent(baseTimeSec) + '&_=' + Date.now());
     na.load();
+    audioRestartAt = performance.now();
     (function tp() {
       if (token !== playSeq || !curId) return;
       var p = na.play();
@@ -1249,6 +1357,19 @@ main{padding:14px 18px 30px}
         if (!na.paused && na.readyState >= 2 && na.currentTime > 0) startVideo(token);
         return;
       }
+      // A sync hold owns alignment right now: release it when the
+      // restarted audio pipe is actually playing (the deadline keeps
+      // a dead pipe from trapping playback — the keeper then trims
+      // whatever offset remains, as before).
+      if (syncHold) {
+        if (audioPlaying() || performance.now() > syncHold.deadline) endSyncHold();
+        return;
+      }
+      // An audio pipe we restarted (a seek, a resume) that hasn't
+      // started playing yet has no measurable position: treating the
+      // gap as drift is what used to throw the video into a full
+      // restart seconds after an in-buffer seek. Wait it out.
+      if (!audioPlaying() && performance.now() - audioRestartAt < 8000) return;
       if (forceStarted && !streamEnded && !na.paused && na.currentTime > 0) {
         // The video was force-started silently and the audio has only
         // just arrived: restart the cheap audio pipe at the video's
@@ -1259,6 +1380,7 @@ main{padding:14px 18px 30px}
         audioBaseSec = vpos;
         na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(vpos) + '&_=' + Date.now());
         na.load();
+        audioRestartAt = performance.now();
         var fp = na.play(); if (fp && fp.catch) fp.catch(function () {});
         return;
       }
@@ -1273,6 +1395,7 @@ main{padding:14px 18px 30px}
       if (Math.abs(drift) > 2.5) {
         if (now - lastKeeperAt < 5000) return;
         lastKeeperAt = now;
+        beaconDiag('keeper-restart', { drift: +drift.toFixed(2), pos: +currentPosition().toFixed(1), quality: $('quality').value });
         try { na.playbackRate = 1; } catch (e) {}
         restartVideoAt(audioPos, token);
         return;
@@ -1329,6 +1452,7 @@ main{padding:14px 18px 30px}
 
   var PAUSE_GRACE_MS = 10 * 60 * 1000;
   function softPause() {
+    if (syncHold) return; // an alignment hold owns the pipes right now
     if (!cur || !player || softPaused || isLiveStream) return;
     if ($('audioMode').value !== 'separate') return;
     var src = player.source;
@@ -1360,6 +1484,7 @@ main{padding:14px 18px 30px}
       audioBaseSec = pos;
       na.src = withKey('/api/audio?v=' + encodeURIComponent(curId) + '&t=' + encodeURIComponent(pos) + '&_=' + Date.now());
       na.load();
+      audioRestartAt = performance.now();
     }
     var p = na.play(); if (p && p.catch) p.catch(function () {});
     if (src && src.resumeFeed) { try { src.resumeFeed(); } catch (e) {} }

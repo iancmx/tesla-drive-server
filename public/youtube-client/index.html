@@ -90,7 +90,8 @@ main{padding:14px 18px 30px}
 .seekrow input[type=range]:disabled{opacity:.35}
 .watchctl{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px;background:var(--surface);border-radius:12px;padding:10px 14px}
 .watchctl .btn{background:#3d3d3d;border-radius:999px;padding:11px 18px;font-size:14.5px;font-weight:500;min-height:44px}
-.watchctl .btn-stop{background:#600}
+.watchctl .btn-primary{background:var(--red);color:#fff;font-weight:600;padding:11px 26px}
+.watchctl .btn-minor{background:transparent;color:var(--sub);border:1px solid #444;padding:6px 12px;font-size:12.5px;min-height:34px}
 .bufbar{position:relative;height:4px;background:#26262c;border-radius:2px;margin:4px 0 2px}
 #bufFill{position:absolute;top:0;bottom:0;background:#5a5a64;border-radius:2px}
 #bufPlay{position:absolute;top:-2px;width:2px;height:8px;background:#fff}
@@ -158,11 +159,11 @@ main{padding:14px 18px 30px}
     </div>
     <div class="bufbar"><div id="bufFill"></div><div id="bufPlay"></div></div>
     <div class="watchctl">
-      <button class="btn" id="npPause" disabled>&#10074;&#10074; Pause</button>
-      <button class="btn btn-stop" id="npStop">Stop</button>
+      <button class="btn btn-primary" id="npPause" disabled>&#10074;&#10074; Pause</button>
       <button class="btn" id="npResume" disabled>Resume</button>
       <button class="btn" id="btnBack10" disabled>&#8722;10s</button>
       <button class="btn" id="btnFwd10" disabled>+10s</button>
+      <button class="btn btn-minor" id="npStop">Stop</button>
       <label for="vol">Sound</label>
       <input type="range" id="vol" min="0" max="100" value="100">
       <button class="btn" id="btnSync">Sync +2s</button>

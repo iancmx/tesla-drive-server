@@ -296,6 +296,39 @@ QtWebEngine) cannot do here.
   browser's restrictions. The `/probe/` page exists to re-check what the
   car still allows.
 
+## Reading the stream logs (CPU or bandwidth?)
+
+Every stream writes structured lines to the server log
+(`docker logs tesla-drive`), designed to answer "is the bottleneck CPU
+or bandwidth — and if bandwidth, which side?":
+
+- `[stream #N video] start v=… q=480p mode=separate live=0 resolve=1234ms`
+  — a stream began; `resolve=` is how long yt-dlp took to hand back a
+  stream URL (slow here = YouTube-side latency).
+- `[stream #N] t+15s sent=2.4MB (1.15x) ffmpeg-cpu=42% speed=2.21x queue=2734KB load=1.20`
+  every ~15 s — `sent … (Nx)` is the achieved delivery rate vs the
+  stream's nominal rate (~1.0x is healthy); `ffmpeg-cpu=` is the
+  transcoder's CPU; `speed=` is ffmpeg's own processing rate (VOD aims
+  for 2x, live/audio for 1x); `queue=` is produced-but-unsent media.
+- `[stream #N] end reason=… after=… sent=… avg=… ffmpeg-cpu-avg=… speed-avg=… exit=… hint=…`
+  — the summary, with a computed `hint`:
+  - `cpu-bound` — ffmpeg pinned near a full core and falling behind:
+    the transcode is the limit. Drop a quality level.
+  - `input-bound (YouTube->server)` — ffmpeg's speed sags while its
+    CPU idles: the fetch from YouTube is throttled or slow.
+  - `delivery-bound (server->car)` — production is healthy but the
+    sent rate can't hold realtime: the proxy/cellular path to the car.
+  - `no-bottleneck` — the stream kept up; a stall with this hint
+    points at the client side (see the `[client]` lines: decoded fps,
+    arrival rate, buffer stage depth, A/V drift, beaconed every ~15 s
+    during playback).
+  - Non-zero exits also carry `err="…"`, the most relevant line from
+    ffmpeg's own output (e.g. a 403 from the CDN).
+- `[resolve] ws v=… failed: bot-blocked — …` — resolve failures (also
+  `info` / `audio`) are logged with yt-dlp's error class and message,
+  so a client that says "check docker logs" doesn't send you to an
+  empty log.
+
 ## Security
 
 Clean-room server code (the original repo's Twitch server was **not**

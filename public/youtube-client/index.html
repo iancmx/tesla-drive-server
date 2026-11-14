@@ -224,6 +224,7 @@ main{padding:14px 18px 30px}
   var bufferHoldSince = 0, lastKeeperAt = 0;
   var syncOffsetSec = 0, forceStarted = false, streamGen = 0, stablePlaySince = 0;
   var lastByteSample = 0, lastByteSampleAt = 0, arrivalRate = 0, stallTimes = [];
+  var lastStatsAt = 0, lastStatsFrames = 0;
   var lastCt = -1, lastAdvanceAt = 0, playStartedAt = 0, preRollDone = false;
   var bufferingNow = false, autoResumeAttempts = 0, streamEnded = false, failedStarts = 0;
   var syncHold = null; // freeze-and-release alignment hold while a restarted audio pipe loads
@@ -661,6 +662,7 @@ main{padding:14px 18px 30px}
     stopWatchdog();
     lastCt = -1; lastAdvanceAt = performance.now(); playStartedAt = performance.now();
     preRollDone = false; bufferingNow = true; streamEnded = false;
+    lastStatsAt = performance.now(); lastStatsFrames = 0;
     setBufferingUI(true, 'Buffering…');
     watchdogTimer = setInterval(function () {
       if (token !== playSeq || streamEnded) return;
@@ -688,6 +690,24 @@ main{padding:14px 18px 30px}
         if (bpsNow) arrivalRate = ((bytesReceived - lastByteSample) / bpsNow) / ((now - lastByteSampleAt) / 1000);
         if (now - lastByteSampleAt >= 2000) { lastByteSample = bytesReceived; lastByteSampleAt = now; }
       } else { lastByteSample = bytesReceived; lastByteSampleAt = now; }
+      // Periodic client stats beacon (~15s while playing): decoded
+      // fps, arrival rate, buffer stage depth and A/V drift. The
+      // server logs it beside the [stream #N] lines, so a stall can
+      // be pinned to CPU, input or delivery from one log view.
+      if (preRollDone && now - lastStatsAt >= 15000) {
+        var dtS = Math.max(1, (now - lastStatsAt) / 1000);
+        var statFps = (framesDecoded - lastStatsFrames) / dtS;
+        lastStatsAt = now; lastStatsFrames = framesDecoded;
+        var stageSec = null, driftSec = null;
+        try {
+          if (player && player.source && player.source.getState) stageSec = +player.source.getState().unfedSec.toFixed(1);
+          else if (player && player.source && typeof player.source.queuedBytes === 'number' && streamBytesPerSec()) stageSec = +(player.source.queuedBytes / streamBytesPerSec()).toFixed(1);
+        } catch (e) {}
+        if ($('audioMode').value === 'separate' && na && na.src) {
+          driftSec = +((audioBaseSec + (na.currentTime || 0)) - (baseTimeSec + decodedSeconds())).toFixed(2);
+        }
+        beaconDiag('stats', { fps: +statFps.toFixed(1), arrival: +arrivalRate.toFixed(2), stageSec: stageSec, drift: driftSec, quality: $('quality').value, mode: $('audioMode').value });
+      }
       if (bufferingNow) {
         setBufferingUI(true, arrivalRate ? 'Buffering… receiving ~' + arrivalRate.toFixed(1) + '× speed' : 'Buffering…');
       }

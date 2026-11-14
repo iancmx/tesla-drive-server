@@ -25,6 +25,7 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { spawn, execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { URL } = require('url');
@@ -87,6 +88,79 @@ const QUALITY = {
   '1080': { scale: '1920:1080', canvas: [1920, 1080], bitrate: '3500k' },
 };
 const WATCH_URL = (id) => 'https://www.youtube.com/watch?v=' + id;
+
+// ---- Stream metering (bottleneck logging) --------------------------------
+// Per-stream start / periodic / end log lines that separate the three
+// places a stream can starve: ffmpeg CPU (transcode-bound), the input
+// side (YouTube -> server: ffmpeg's own speed= stat sags while its CPU
+// stays idle — throttled or slow fetch), and delivery (server -> car:
+// production healthy but the sent rate can't hold realtime). Read with
+// `docker logs tesla-drive`; every line is prefixed [stream #N].
+let streamSeq = 0;
+function procCpuSeconds(pid) {
+  try {
+    const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return (parseInt(rest[11], 10) + parseInt(rest[12], 10)) / 100; // utime+stime ticks, CLK_TCK=100
+  } catch (e) { return null; }
+}
+function parseFfmpegSpeed(stderrText) {
+  const m = String(stderrText || '').match(/speed=\s*([\d.]+)x/g);
+  if (!m || !m.length) return null;
+  const v = parseFloat(m[m.length - 1].replace(/speed=\s*/, '').replace(/x$/, ''));
+  return isFinite(v) ? v : null;
+}
+function startStreamMeter(kind, desc) {
+  const id = ++streamSeq;
+  const t0 = Date.now();
+  let bytes = 0, lastCpuSec = null, lastCpuAt = t0, cpuSecTotal = 0;
+  let speedSum = 0, speedCount = 0, ended = false;
+  const meter = {
+    id,
+    addBytes(n) { bytes += n; },
+    get bytes() { return bytes; },
+    // Sample ffmpeg's CPU (via /proc) and the speed= stat from its
+    // stderr tail; accumulates averages for the end-of-stream summary.
+    sample(pid, stderrText) {
+      const now = Date.now();
+      const cpuSec = pid ? procCpuSeconds(pid) : null;
+      let cpuPct = null;
+      if (cpuSec !== null && lastCpuSec !== null && now > lastCpuAt) {
+        cpuPct = (cpuSec - lastCpuSec) / ((now - lastCpuAt) / 1000) * 100;
+        cpuSecTotal += Math.max(0, cpuSec - lastCpuSec);
+      }
+      if (cpuSec !== null) { lastCpuSec = cpuSec; lastCpuAt = now; }
+      const speed = parseFfmpegSpeed(stderrText);
+      if (speed !== null) { speedSum += speed; speedCount++; }
+      const elapsed = (now - t0) / 1000;
+      return { elapsed, cpuPct, speed,
+        speedAvg: speedCount ? speedSum / speedCount : null,
+        cpuAvg: elapsed > 0 ? cpuSecTotal / elapsed * 100 : 0 };
+    },
+    end(reason) {
+      if (ended) return null;
+      ended = true;
+      const elapsed = (Date.now() - t0) / 1000;
+      return { id, reason, elapsed, bytes,
+        cpuAvg: elapsed > 0 ? cpuSecTotal / elapsed * 100 : 0,
+        speedAvg: speedCount ? speedSum / speedCount : null };
+    },
+  };
+  console.log('[stream #' + id + ' ' + kind + '] start ' + desc);
+  return meter;
+}
+// prodTarget: the ffmpeg production rate the stream aims for (2 for
+// readrate-capped VOD, 1 for realtime-paced). sendRatio: achieved send
+// rate / nominal stream byte rate.
+function bottleneckHint(s, prodTarget, sendRatio) {
+  if (s.elapsed < 6) return 'too-short';
+  if (s.speedAvg === null) return 'unknown';
+  const prod = s.speedAvg / prodTarget;
+  if (s.cpuAvg >= 85 && prod < 0.97) return 'cpu-bound';
+  if (prod < 0.95 && s.cpuAvg < 70) return 'input-bound (YouTube->server)';
+  if (sendRatio !== null && sendRatio < 0.88 && prod >= 0.97) return 'delivery-bound (server->car)';
+  return 'no-bottleneck';
+}
 
 // Cookies are used ONLY for the personalized feeds (/api/feed) — never
 // for playback resolves, info, search, trending or channel listings.
@@ -347,6 +421,15 @@ app.post('/api/probe-report', express.json({ limit: '1mb' }), (req, res) => {
     'probe-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json');
   fs.writeFile(filename, JSON.stringify(req.body || {}, null, 2), (err) => {
     if (err) return res.status(500).json({ ok: false, error: 'could-not-save' });
+    // Playback stats beacons also land in the log, interleaved with the
+    // [stream #N] lines, so client decode rate / stage / drift can be
+    // read against server CPU / input / delivery at the same moment.
+    if (req.body && req.body.kind === 'stats' && req.body.data) {
+      const d = req.body.data;
+      console.log('[client] fps=' + (d.fps ?? '?') + ' arrival=' + (d.arrival ?? '?') + 'x stage=' +
+        (d.stageSec ?? '?') + 's drift=' + (d.drift ?? '?') + 's q=' + (d.quality ?? '?') +
+        ' mode=' + (d.mode ?? '?'));
+    }
     // Retention: keep only the newest 50 reports (ISO names sort by age),
     // so this unauthenticated endpoint can't fill the disk.
     try {
@@ -378,6 +461,8 @@ app.get('/api/info', async (req, res) => {
       isLive: !!info.is_live,
     });
   } catch (e) {
+    console.error('[resolve] info v=' + id + ' failed: ' + (e.type || 'resolve-failed') +
+      (e.stderr ? ' — ' + String(e.stderr).slice(0, 200) : ''));
     res.status(502).json({ ok: false, error: e.type || 'resolve-failed', detail: e.stderr || '' });
   }
 });
@@ -575,7 +660,7 @@ app.get('/api/channel', async (req, res) => {
 });
 
 // ---- Audio (separate MP3 pipe, as in the original repo) --------------------
-function streamMp3(req, res, inputUrl, startSeconds = 0) {
+function streamMp3(req, res, inputUrl, startSeconds = 0, meta = {}) {
   if (activeStreams >= MAX_STREAMS) {
     return res.status(503).json({ ok: false, error: 'server-busy' });
   }
@@ -595,20 +680,51 @@ function streamMp3(req, res, inputUrl, startSeconds = 0) {
     '-c:a', 'libmp3lame', '-b:a', '48k', '-ar', '22050', '-ac', '1',
     '-f', 'mp3', '-',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const meter = startStreamMeter('audio', 'v=' + (meta.id || 'url') +
+    ' resolve=' + (meta.resolveMs != null ? meta.resolveMs : '?') + 'ms');
+  let aStderrTail = '';
+  ffmpeg.stderr.on('data', (d) => { aStderrTail = (aStderrTail + d.toString()).slice(-4000); });
+  ffmpeg.stdout.on('data', (c) => meter.addBytes(c.length));
   ffmpeg.stdout.pipe(res);
-  ffmpeg.stderr.on('data', () => {});
+  let clientGone = false;
+  // Sample every 5s; print every third sample (~15s) so the CPU
+  // averages stay honest even on short streams.
+  let statsTick = 0;
+  const statsTimer = setInterval(() => {
+    const snap = meter.sample(ffmpeg.pid, aStderrTail);
+    if (++statsTick % 3 !== 0) return;
+    const ratio = snap.elapsed > 0 ? (meter.bytes / snap.elapsed) / 6000 : 0; // 48kbit/s MP3 = 6000 B/s
+    console.log('[stream #' + meter.id + '] t+' + snap.elapsed.toFixed(0) + 's sent=' +
+      (meter.bytes / 1024).toFixed(0) + 'KB (' + ratio.toFixed(2) + 'x) ffmpeg-cpu=' +
+      (snap.cpuPct === null ? '?' : snap.cpuPct.toFixed(0)) + '% speed=' +
+      (snap.speed === null ? '?' : snap.speed.toFixed(2)) + 'x load=' + os.loadavg()[0].toFixed(2));
+  }, 5000);
   ffmpeg.on('error', () => { try { res.end(); } catch (e) {} });
-  ffmpeg.on('close', () => { activeStreams--; try { res.end(); } catch (e) {} });
-  req.on('close', () => { try { ffmpeg.kill(); } catch (e) {} });
+  ffmpeg.on('close', (code) => {
+    activeStreams--;
+    clearInterval(statsTimer);
+    meter.sample(ffmpeg.pid, aStderrTail);
+    const s = meter.end(clientGone ? 'client-gone' : 'ffmpeg-exit-' + code);
+    if (s) {
+      const ratio = s.elapsed > 0 ? (s.bytes / s.elapsed) / 6000 : 0;
+      console.log('[stream #' + s.id + '] end reason=' + s.reason + ' after=' + s.elapsed.toFixed(0) +
+        's sent=' + (s.bytes / 1024).toFixed(0) + 'KB avg=' + ratio.toFixed(2) + 'x ffmpeg-cpu-avg=' +
+        s.cpuAvg.toFixed(0) + '% speed-avg=' + (s.speedAvg === null ? '?' : s.speedAvg.toFixed(2)) +
+        'x exit=' + code + ' hint=' + bottleneckHint(s, 1, ratio));
+    }
+    try { res.end(); } catch (e) {}
+  });
+  req.on('close', () => { clientGone = true; try { ffmpeg.kill(); } catch (e) {} });
 }
 
 app.get('/api/audio', async (req, res) => {
+  const audioT0 = Date.now();
   const startSeconds = parseSeekOffset(req.query.t ?? req.query.start);
   if (startSeconds === null) return res.status(400).json({ ok: false, error: 'Invalid t (seek offset in seconds)' });
   if (req.query.url) {
     const direct = await validateDirectUrl(String(req.query.url));
     if (!direct) return res.status(400).json({ ok: false, error: 'Invalid url' });
-    return streamMp3(req, res, direct, startSeconds);
+    return streamMp3(req, res, direct, startSeconds, { id: 'url', resolveMs: Date.now() - audioT0 });
   }
   const id = String(req.query.v || '');
   if (!VIDEO_ID_RE.test(id)) return res.status(400).json({ ok: false, error: 'Invalid video id' });
@@ -618,8 +734,10 @@ app.get('/api/audio', async (req, res) => {
     // spawning ffmpeg now would leave it transcoding into a dead socket
     // with no close event left to kill it.
     if (res.destroyed) return;
-    streamMp3(req, res, audioUrl, startSeconds);
+    streamMp3(req, res, audioUrl, startSeconds, { id, resolveMs: Date.now() - audioT0 });
   } catch (e) {
+    console.error('[resolve] audio v=' + id + ' failed: ' + (e.type || 'resolve-failed') +
+      (e.stderr ? ' — ' + String(e.stderr).slice(0, 200) : ''));
     res.status(502).json({ ok: false, error: e.type || 'resolve-failed', detail: e.stderr || '' });
   }
 });
@@ -690,6 +808,7 @@ wss.on('connection', async (ws, req) => {
   const isLive = params.get('live') === '1';
   let inputUrl = null;
   let audioUrl = null;
+  const resolveT0 = Date.now();
 
   const direct = params.get('url');
   const videoId = params.get('v');
@@ -714,6 +833,8 @@ wss.on('connection', async (ws, req) => {
         inputUrl = await resolveStream(videoId, videoFormat);
       }
     } catch (e) {
+      console.error('[resolve] ws v=' + videoId + ' q=' + quality + ' failed: ' + (e.type || 'resolve-failed') +
+        (e.stderr ? ' — ' + String(e.stderr).slice(0, 200) : ''));
       sendJson({ type: 'error', error: e.type || 'resolve-failed',
         message: e.type === 'bot-blocked'
           ? 'YouTube blocked this server (sign-in/bot check). Try a residential connection or YT_DLP_COOKIES.'
@@ -735,6 +856,7 @@ wss.on('connection', async (ws, req) => {
     message: 'Starting MPEG1-TS stream (' + quality + 'p, ' +
       (combined ? 'combined A/V' : 'video only') + ') at ' + startSeconds + 's...',
   });
+  const resolveMs = Date.now() - resolveT0;
 
   // Pacing: on-demand videos are encoded at a CAPPED 2x realtime
   // (-readrate). The cap matters: an earlier fully-unpaced build flooded
@@ -821,6 +943,18 @@ wss.on('connection', async (ws, req) => {
   activeStreams++;
   const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
+  // Bottleneck metering for this stream (see startStreamMeter): the
+  // START line carries the resolve time, periodic lines track ffmpeg
+  // CPU vs its speed= stat vs the achieved send rate, and the END line
+  // summarizes with a bottleneck hint.
+  const kbpsTotal = (parseInt(q.bitrate, 10) || 1100) + (combined ? 128 : 0);
+  const nominalBps = kbpsTotal * 1000 / 8 * 1.06;
+  const prodTarget = pacedRealtime ? 1 : 2;
+  let queueBytesNow = 0;
+  const meter = startStreamMeter('video', 'v=' + (videoId || 'url') + ' q=' + quality +
+    'p mode=' + (combined ? 'combined' : 'separate') + ' live=' + (isLive ? 1 : 0) +
+    ' resolve=' + resolveMs + 'ms');
+
   // Backpressure (all streams): if the client falls behind, PAUSE
   // ffmpeg's output pipe instead of dropping chunks. Dropping MPEG1
   // chunks corrupts the picture until the next keyframe (visible
@@ -831,7 +965,7 @@ wss.on('connection', async (ws, req) => {
   let ffmpegEnded = false, ffmpegEndCode = null;
   const sendDirect = (chunk) => {
     if (ws.readyState !== 1) return;
-    try { ws.send(chunk); } catch (e) {}
+    try { ws.send(chunk); meter.addBytes(chunk.length); } catch (e) {}
     if (ws.bufferedAmount > 16 * 1024 * 1024 && !bpTimer) {
       ffmpeg.stdout.pause();
       bpTimer = setInterval(() => {
@@ -863,6 +997,7 @@ wss.on('connection', async (ws, req) => {
     let paceBudget = burstBytes, lastDrainAt = Date.now();
     ffmpeg.stdout.on('data', (chunk) => {
       pending.push(chunk); pendingBytes += chunk.length;
+      queueBytesNow = pendingBytes;
       if (pendingBytes > 16 * 1024 * 1024) { try { ffmpeg.stdout.pause(); } catch (e) {} }
     });
     drainTimer = setInterval(() => {
@@ -880,8 +1015,9 @@ wss.on('connection', async (ws, req) => {
         if (sentBytes > 0 && paceBudget < next.length) break;
         pending.shift(); pendingBytes -= next.length;
         try { ws.send(next); } catch (e) {}
-        sentBytes += next.length; paceBudget -= next.length;
+        sentBytes += next.length; paceBudget -= next.length; meter.addBytes(next.length);
       }
+      queueBytesNow = pendingBytes;
       if (pendingBytes < 4 * 1024 * 1024) { try { ffmpeg.stdout.resume(); } catch (e) {} }
       if (ffmpegEnded && pendingBytes === 0) finishStream();
     }, 50);
@@ -891,9 +1027,43 @@ wss.on('connection', async (ws, req) => {
   // status line instead of a silent "Stream ended".
   let stderrTail = '';
   ffmpeg.stderr.on('data', (d) => {
-    stderrTail = (stderrTail + d.toString()).slice(-600);
+    stderrTail = (stderrTail + d.toString()).slice(-4000);
   });
   ffmpeg.on('error', (e) => { sendJson({ type: 'error', message: e.message.slice(0, 120) }); });
+  // Periodic bottleneck line every ~15s (samples every 5s so the CPU
+  // and speed averages stay honest even on short streams).
+  let statsTick = 0;
+  const statsTimer = setInterval(() => {
+    const snap = meter.sample(ffmpeg.pid, stderrTail);
+    if (++statsTick % 3 !== 0) return;
+    const ratio = snap.elapsed > 0 ? (meter.bytes / snap.elapsed) / nominalBps : 0;
+    const queue = pacedRealtime ? ws.bufferedAmount : queueBytesNow;
+    console.log('[stream #' + meter.id + '] t+' + snap.elapsed.toFixed(0) + 's sent=' +
+      (meter.bytes / 1048576).toFixed(1) + 'MB (' + ratio.toFixed(2) + 'x) ffmpeg-cpu=' +
+      (snap.cpuPct === null ? '?' : snap.cpuPct.toFixed(0)) + '% speed=' +
+      (snap.speed === null ? '?' : snap.speed.toFixed(2)) + 'x queue=' + Math.round(queue / 1024) +
+      'KB load=' + os.loadavg()[0].toFixed(2));
+  }, 5000);
+  let endLogged = false;
+  function logStreamEnd(reason) {
+    if (endLogged) return;
+    endLogged = true;
+    clearInterval(statsTimer);
+    meter.sample(ffmpeg.pid, stderrTail);
+    const s = meter.end(reason);
+    if (!s) return;
+    const ratio = s.elapsed > 0 ? (s.bytes / s.elapsed) / nominalBps : 0;
+    let errBit = '';
+    if (ffmpegEndCode !== 0 && ffmpegEndCode !== null) {
+      const lines = stderrTail.split(/[\r\n]+/).map((l) => l.trim())
+        .filter((l) => /(error|403|forbidden|invalid|failed|unable|denied|empty)/i.test(l) && !/^frame=/.test(l));
+      if (lines.length) errBit = ' err="' + lines[lines.length - 1].slice(0, 160) + '"';
+    }
+    console.log('[stream #' + s.id + '] end reason=' + s.reason + ' after=' + s.elapsed.toFixed(0) +
+      's sent=' + (s.bytes / 1048576).toFixed(2) + 'MB avg=' + ratio.toFixed(2) + 'x ffmpeg-cpu-avg=' +
+      s.cpuAvg.toFixed(0) + '% speed-avg=' + (s.speedAvg === null ? '?' : s.speedAvg.toFixed(2)) +
+      'x exit=' + ffmpegEndCode + ' hint=' + bottleneckHint(s, prodTarget, ratio) + errBit);
+  }
   // finishStream reports the end exactly once — immediately for the
   // direct path, or after the pacer queue has flushed for VOD, so the
   // pacer can never truncate the tail of a finished video.
@@ -906,6 +1076,7 @@ wss.on('connection', async (ws, req) => {
     if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
     const tail = stderrTail.trim().split('\n').filter(Boolean).slice(-2).join(' | ').slice(0, 220);
     if (code !== 0 && tail) console.error('ffmpeg exited (code ' + code + '): ' + tail);
+    logStreamEnd(code === 0 ? 'ended' : 'ffmpeg-exit-' + code);
     sendJson({ type: 'status', message: 'Stream ended (code ' + code + ')' + (code !== 0 && tail ? ': ' + tail : '') });
     try { ws.close(); } catch (e) {}
   }
@@ -918,10 +1089,12 @@ wss.on('connection', async (ws, req) => {
   const killFfmpeg = () => {
     if (bpTimer) { clearInterval(bpTimer); bpTimer = null; }
     if (drainTimer) { clearInterval(drainTimer); drainTimer = null; }
+    clearInterval(statsTimer);
     try { ffmpeg.kill(); } catch (e) {}
   };
-  ws.on('close', killFfmpeg);
-  ws.on('error', killFfmpeg);
+  const onWsGone = () => { logStreamEnd('client-gone'); killFfmpeg(); };
+  ws.on('close', onWsGone);
+  ws.on('error', onWsGone);
 });
 
 server.listen(PORT, HOST, () => {

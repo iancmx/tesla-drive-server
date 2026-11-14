@@ -136,13 +136,16 @@ from the Docker tab. The template maps port 8742, `/config` →
 `/mnt/user/appdata/tesla-drive`, and the `PORT` / `HOST` /
 `YT_DLP_COOKIES` variables.
 
-**Cookies (optional):** if YouTube bot-blocks your IP, export a Netscape
-`cookies.txt` from a signed-in browser and drop it in the appdata folder
-as `cookies.txt` (see `config/cookies.txt.example`). The server only
-passes it to yt-dlp when the file exists. The same file also unlocks
-the personalized feeds: when cookies are present, the client shows
-For You, Subscriptions, Watch Later, Liked and History chips, read through
-yt-dlp with your session. Sessions expire — when a feed starts
+**Cookies (optional):** export a Netscape `cookies.txt` from a signed-in
+browser and drop it in the appdata folder as `cookies.txt` (see
+`config/cookies.txt.example`) to unlock the personalized feeds: when
+cookies are present, the client shows For You, Subscriptions, Watch
+Later, Liked and History chips, read through yt-dlp with your session.
+Cookies are used **only** for those feed reads — playback resolves,
+info, search, trending and channel listings all run anonymously, by
+design: a stale or malformed cookies file once broke every stream
+resolve (2026-11-13), and keeping it out of the loading path means it
+can never do that again. Sessions expire — when a feed starts
 reporting "session-expired", re-export the file.
 
 **Remote access / reverse proxy:** because everything is same-origin on
@@ -256,10 +259,10 @@ QtWebEngine) cannot do here.
   gets *"Sign in to confirm you're not a bot"* (LOGIN_REQUIRED) and no
   stream can be resolved — search/info/audio all fail the same way. The
   server classifies this and returns `bot-blocked` so the client can say
-  so. Remedies: run the server from a home/residential IP, or export
-  cookies from a browser where you are signed in to YouTube and set
-  `YT_DLP_COOKIES=/path/to/cookies.txt` in `.env` (passed to yt-dlp as
-  `--cookies`). Keep that file private — it is a login credential.
+  so. Remedy: run the server from a home/residential IP. (Cookies do not
+  help here — by design they are only ever passed to the personalized
+  feed reads, never to resolves; see "Cookies" above. And keep that
+  file private — it is a login credential.)
 - **Buffering (VOD):** on-demand videos are encoded at a capped 2×
   realtime (`-readrate 2`; on ffmpeg ≥ 6.1 the first ~10 media-seconds
   also burst immediately), so the client steadily banks a buffer lead

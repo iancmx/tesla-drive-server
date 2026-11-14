@@ -88,7 +88,14 @@ const QUALITY = {
 };
 const WATCH_URL = (id) => 'https://www.youtube.com/watch?v=' + id;
 
-function cookieArgs() {
+// Cookies are used ONLY for the personalized feeds (/api/feed) — never
+// for playback resolves, info, search, trending or channel listings.
+// Deliberate split (Ian, 2026-11-13): his exported cookies.txt broke
+// every stream resolve (videos looped Buffering -> Reconnecting with
+// zero data and no ffmpeg error) while feed reads were unaffected.
+// Keeping cookies out of the loading path means a stale or malformed
+// file can only ever cost the personalized chips, never playback.
+function feedCookieArgs() {
   // Only pass --cookies when the file actually exists: yt-dlp hard-fails on
   // a missing cookies file, and Docker/compose set YT_DLP_COOKIES by default
   // (the file itself is optional).
@@ -126,7 +133,7 @@ function ytDlp(args, timeoutMs = 30000, maxBuffer = 16 * 1024 * 1024) {
 // Resolve a direct stream URL for `format` ('bestvideo...' / 'bestaudio...').
 async function resolveStream(videoId, format) {
   const args = ['-g', '--no-playlist', '--no-warnings', '-f', format,
-    ...cookieArgs(), WATCH_URL(videoId)];
+    WATCH_URL(videoId)];
   const out = await ytDlp(args, 30000);
   const url = out.trim().split('\n').filter(Boolean)[0];
   if (!url || !url.startsWith('http')) {
@@ -358,7 +365,7 @@ app.get('/api/info', async (req, res) => {
   if (!VIDEO_ID_RE.test(id)) return res.status(400).json({ ok: false, error: 'Invalid video id' });
   try {
     const out = await ytDlp(['-J', '--no-playlist', '--skip-download', '--no-warnings',
-      ...cookieArgs(), WATCH_URL(id)], 30000);
+      WATCH_URL(id)], 30000);
     const info = JSON.parse(out);
     res.json({
       ok: true,
@@ -381,7 +388,7 @@ app.get('/api/search', async (req, res) => {
   if (!q) return res.status(400).json({ ok: false, error: 'Missing q' });
   try {
     const out = await ytDlp(['--flat-playlist', '--no-warnings', '-J',
-      ...cookieArgs(), 'ytsearch20:' + q], 45000);
+      'ytsearch20:' + q], 45000);
     const data = JSON.parse(out);
     const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
     res.json({ ok: true, source: 'yt-dlp', query: q, results });
@@ -403,7 +410,7 @@ const PERSONAL_FEEDS = {
   liked: 'https://www.youtube.com/playlist?list=LL',
   history: 'https://www.youtube.com/feed/history',
 };
-function hasCookies() { return cookieArgs().length > 0; }
+function hasCookies() { return feedCookieArgs().length > 0; }
 
 app.get('/api/session', (req, res) => {
   // Presence only — the client shows the personalized chips when a
@@ -421,7 +428,7 @@ app.get('/api/feed', async (req, res) => {
   }
   try {
     const out = await ytDlp(['--flat-playlist', '--playlist-end', '30', '--no-warnings', '-J',
-      ...cookieArgs(), url], 45000);
+      ...feedCookieArgs(), url], 45000);
     const data = JSON.parse(out);
     const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
     if (!results.length) {
@@ -481,7 +488,7 @@ app.get('/api/trending', async (req, res) => {
   // Path 1: yt-dlp on the YouTube trending feed.
   try {
     const out = await ytDlp(['--flat-playlist', '--no-warnings', '-J',
-      ...cookieArgs(), 'https://www.youtube.com/feed/trending'], 45000);
+      'https://www.youtube.com/feed/trending'], 45000);
     const data = JSON.parse(out);
     const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
     if (results.length >= 5) {
@@ -525,7 +532,7 @@ app.get('/api/channel', async (req, res) => {
   // Path 1: yt-dlp on the channel's Videos tab (flat playlist, latest first).
   try {
     const out = await ytDlp(['--flat-playlist', '--playlist-end', '30', '--no-warnings', '-J',
-      ...cookieArgs(), 'https://www.youtube.com/channel/' + id + '/videos'], 45000);
+      'https://www.youtube.com/channel/' + id + '/videos'], 45000);
     const data = JSON.parse(out);
     const results = (data.entries || []).map(mapFlatEntry).filter(Boolean);
     if (results.length) {
